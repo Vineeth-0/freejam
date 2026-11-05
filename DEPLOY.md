@@ -9,6 +9,17 @@ and `HOST` (default `0.0.0.0`) from the environment and exposes `/health`.
 
 There are three practical options.
 
+### Quick setup on Windows
+
+FreeJam does not silently start a relay. The host chooses and runs one, which
+keeps relay ownership clear: each person can run their own relay, and session
+join codes point guests to that host's chosen relay. For a private same-Wi-Fi
+session, run `node freejam-relay.js` in this folder and use the `ws://` LAN
+address it prints. For friends outside your network, follow Option 2 below;
+the Cloudflare quick tunnel URL is temporary and must stay running alongside
+the relay. Paste the resulting `wss://` URL into **Playback sync → Host a sync
+session**. The same relay address is used for friends features.
+
 ---
 
 ## Option 1 — Render (free, stable URL)
