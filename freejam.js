@@ -146,6 +146,8 @@
     incomingJam: null,
     pendingJam: null,
     lastNotifyAt: 0,
+    handshaken: false,
+    handshakeTimer: null,
   };
 
   // ---------------------------------------------------------------------------
@@ -1853,6 +1855,7 @@
       friends.connected = true;
       friends.error = null;
       friends.reconnectDelay = 1000;
+      friends.handshaken = false;
 
       sendFriends({
         t: "hello",
@@ -1863,6 +1866,19 @@
       startFriendsPing();
       flushPendingJam();
       refreshFriendsPanel();
+
+      clearTimeout(friends.handshakeTimer);
+      friends.handshakeTimer = setTimeout(() => {
+        if (
+          friends.ws === socket &&
+          friends.connected &&
+          !friends.handshaken
+        ) {
+          friends.error =
+            "The relay did not answer the friend handshake. Update freejam-relay.js on the relay.";
+          refreshFriendsPanel();
+        }
+      }, 6000);
     };
 
     socket.onmessage = (event) => {
@@ -1887,6 +1903,9 @@
       friends.connected = false;
       friends.ws = null;
       friends.online = new Set();
+      friends.handshaken = false;
+      clearTimeout(friends.handshakeTimer);
+      friends.handshakeTimer = null;
       stopFriendsPing();
 
       const code = event && Number(event.code);
@@ -1895,6 +1914,9 @@
           "This friend identity belongs to another key. Recreate your friend code.";
       } else if (code === 4009) {
         friends.error = "Too many connections to your friend mailbox.";
+      } else if (!friends.error) {
+        friends.error =
+          "Could not connect to the friend relay. Make sure it is running the current freejam-relay.js.";
       }
 
       refreshFriendsPanel();
@@ -1905,6 +1927,9 @@
   function closeFriendsSocket() {
     clearTimeout(friends.reconnectTimer);
     friends.reconnectTimer = null;
+    clearTimeout(friends.handshakeTimer);
+    friends.handshakeTimer = null;
+    friends.handshaken = false;
     stopFriendsPing();
 
     const socket = friends.ws;
@@ -2067,6 +2092,10 @@
     if (!message || typeof message !== "object") return;
 
     if (message.t === "hello-ok") {
+      friends.handshaken = true;
+      clearTimeout(friends.handshakeTimer);
+      friends.handshakeTimer = null;
+
       if (
         friends.identity &&
         typeof message.sendKey === "string" &&
