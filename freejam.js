@@ -2253,6 +2253,19 @@
         font-size: 14px;
         line-height: 1.45;
       }
+      .fj-section {
+        border: 1px solid rgba(255, 255, 255, 0.09);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.025);
+      }
+      .fj-section > summary {
+        padding: 12px 14px;
+        cursor: pointer;
+        font-weight: 700;
+        list-style-position: inside;
+      }
+      .fj-section-body { padding: 0 10px 10px; }
+      .fj-section[open] > summary { margin-bottom: 8px; }
       .fj-status {
         display: flex;
         align-items: center;
@@ -2534,7 +2547,7 @@
     actions.append(
       actionButton("open", "Open playlist", "secondary"),
       actionButton("regenerate", "New invite link", "secondary"),
-      actionButton("announceJam", "Send to friends", "secondary"),
+      actionButton("announceJam", "Invite all friends", "secondary"),
       actionButton("retry", "Check now", "secondary"),
       actionButton(
         state.paused ? "resume" : "pause",
@@ -2560,7 +2573,7 @@
       el(
         "div",
         "fj-hint",
-        "Playback sync follows the host through a relay. Everyone needs FreeJam and access to the relay. Use Spotify's normal player controls for play, pause, skipping and seeking. Sync mode does not need a playlist."
+        "Sync shares playback controls. Everyone needs FreeJam. A relay is a small message server: on the same Wi-Fi you can run it on your PC; for friends elsewhere, use a public wss:// relay or Cloudflare Tunnel. FreeJam does not create or host a relay automatically."
       )
     );
 
@@ -2650,7 +2663,7 @@
 
     const actions = el("div", "fj-actions");
     if (sync.role === "host") {
-      actions.append(actionButton("announceJam", "Send to friends", "secondary"));
+      actions.append(actionButton("announceJam", "Invite all friends", "secondary"));
     }
     if (sync.role === "guest") {
       actions.append(actionButton("syncResync", "Resync", "secondary"));
@@ -2726,6 +2739,12 @@
     );
     row.append(info);
 
+    if (buildLocalJam()) {
+      const invite = el("button", "fj-btn secondary", "Invite");
+      invite.dataset.action = "friendsInviteOne";
+      invite.dataset.friendId = friend.userId;
+      row.append(invite);
+    }
     const remove = el("button", "fj-btn danger", "Remove");
     remove.dataset.action = "friendsRemove";
     remove.dataset.friendId = friend.userId;
@@ -3087,6 +3106,8 @@
     }
 
     if (list) {
+      const requestCard = list.closest(".fj-card");
+      if (requestCard) requestCard.style.display = state.requests.length ? "" : "none";
       list.replaceChildren();
       if (state.requests.length === 0) {
         list.append(
@@ -3125,8 +3146,8 @@
     root.innerHTML = `
       <div class="fj-status" data-fj="status"></div>
       <div data-fj="session"></div>
-      <div data-fj="sync"></div>
-      <div data-fj="friends"></div>
+      <details class="fj-section"><summary>Playback sync · relay setup</summary><div class="fj-section-body" data-fj="sync"></div></details>
+      <details class="fj-section"><summary>Friends · direct invites</summary><div class="fj-section-body" data-fj="friends"></div></details>
       <div class="fj-card">
         <div class="fj-card-head">
           <span class="fj-card-title">Recent requests</span>
@@ -3253,6 +3274,20 @@
               ? "Jam invite sent to your friends."
               : "Jam invite queued. It will send when the friend relay reconnects."
           );
+          break;
+        }
+        case "friendsInviteOne": {
+          const friend = friends.list.find(
+            (item) => item.userId === button.dataset.friendId
+          );
+          const jam = buildLocalJam();
+          if (!friend || !jam) return;
+          if (!friends.connected) {
+            Spicetify.showNotification("Connect to your friend relay before sending an individual invite.", true);
+            return;
+          }
+          sendFriends({ t: "dm", to: friend.userId, sendKey: friend.sendKey, jam });
+          Spicetify.showNotification(`Jam invite sent to ${friend.name}.`);
           break;
         }
         case "friendsCreate": {
