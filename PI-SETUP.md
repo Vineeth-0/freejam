@@ -238,13 +238,29 @@ like before.
 
 ## Security notes
 
-- The relay does not store playback history or messages.
+- The relay does not store playback history. It keeps one small mailbox per
+  user so a friend's jam alert can wait for them offline (up to 12 hours), then
+  deletes the pending alert.
+- A friend code contains a mailbox send key, not the owner's private receive
+  key. The relay never broadcasts a jam to all users.
 - Bind it to `127.0.0.1` when Cloudflare Tunnel is the only way in.
 - The `FJ1...` key is a room password, not strong authentication. Only share it
   with people you trust.
 - Keep `cloudflared` updated (`sudo apt update && sudo apt upgrade` or reinstall
   the .deb).
 - Do not forward port `8787` directly to the internet without TLS.
+
+## Updating the relay
+
+From the FreeJam repo on your PC:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\deploy-relay.ps1 -PiHost <pi-address>
+```
+
+This copies `freejam-relay.js` to `~/freejam` and restarts the service. The
+`post-merge` git hook runs the same script automatically when
+`FREEJAM_PI_HOST` is set.
 
 ## Troubleshooting
 

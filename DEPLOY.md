@@ -150,8 +150,13 @@ the internet.
 
 ## Security
 
-- The relay is a dumb message forwarder. It does not store playback history.
+- The relay does not store playback history. It keeps a small per-user mailbox
+  for friend alerts, including a pending alert while that friend is offline
+  (up to 12 hours).
 - The session key inside the `FJ1…` join code acts as a room password.
+- Friend codes contain a mailbox send key, not the owner's private receive key.
+  The relay forwards a jam only to the addressed mailbox; it never broadcasts
+  to everyone.
 - Only a host can create a room; only hosts can send state; only guests can
   send commands.
 - Use TLS (`wss://`) for anything that leaves your machine.

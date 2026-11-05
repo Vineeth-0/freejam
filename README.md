@@ -10,6 +10,7 @@ FreeJam has two independent modes:
 | --- | --- | --- |
 | **Request mode** | No | A normal collaborative playlist acts as a request inbox. New songs guests add are queued on the host's device. |
 | **Sync mode** | Yes | Host-authoritative playback sync over a tiny relay. Skips, seeks and play/pause from any participant are applied for everyone. |
+| **Friends** | Yes | A private alert when someone you added starts a jam. Only added friends can reach your mailbox; nothing is broadcast to everyone. |
 
 Both modes work on free accounts. FreeJam is a cooperative third-party player,
 not Spotify Jam.
@@ -17,8 +18,12 @@ not Spotify Jam.
 ## Files
 
 - `freejam.js` — the Spicetify extension (loads in every Spotify client).
-- `freejam-relay.js` — dependency-free Node.js WebSocket relay used by sync mode.
-- `README.md` — this file.
+- `freejam-relay.js` — dependency-free Node.js WebSocket relay used by sync mode
+  and friend mailboxes.
+- `scripts/sync-to-spicetify.ps1` — copies the extension into Spicetify and
+  applies it.
+- `hooks/post-merge` — git hook that runs the sync script after a pull.
+- `README.md` — this file. See also `DEPLOY.md` and `PI-SETUP.md`.
 
 ## Install the extension
 
@@ -67,8 +72,25 @@ $env:FREEJAM_DRY_RUN = "1"
 git pull
 ```
 
-The Pi relay is a separate machine. When `freejam-relay.js` changes, copy it to
-the Pi and restart the service:
+The Pi relay is a separate machine. If `freejam-relay.js` changes, the same
+post-merge hook can deploy it automatically when `FREEJAM_PI_HOST` is set:
+
+```powershell
+$env:FREEJAM_PI_HOST = "192.168.x.x"
+$env:FREEJAM_PI_USER = "freejam"          # optional
+$env:FREEJAM_PI_DIR = "~/freejam"          # optional
+$env:FREEJAM_PI_SERVICE = "freejam-relay"  # optional
+git pull
+```
+
+Or run the deploy script directly:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\deploy-relay.ps1 -PiHost 192.168.x.x
+```
+
+If the Pi is offline, the script prints a warning and does not block the pull.
+Without `FREEJAM_PI_HOST`, relay changes are skipped. The manual fallback is:
 
 ```bash
 scp freejam-relay.js user@<pi-host>:~/freejam/
@@ -214,6 +236,68 @@ Treat it like a room password.
 
 ---
 
+## Friends and jam alerts
+
+The Friends card lets you get a Spotify notification when someone you added
+starts a jam, and join it in one click.
+
+### One-time setup
+
+1. Open the FreeJam panel → **Friends**.
+2. Enter your name and the same public relay URL you use for sync.
+3. Click **Create my friend code**.
+4. Click **Copy my code** and send it to the people you trust.
+5. Paste a friend's `FJF1…` code into **Add a friend** → **Add friend**.
+
+Repeat step 5 for each friend. When they add your code too, the card shows
+**online** next to their name.
+
+### Getting alerts
+
+- Start a sync session or a request session. FreeJam automatically sends a
+  private jam alert to the friends in your list.
+- You can also click **Send to friends** on an active session.
+- The friend sees a notification and a **Join jam** button in their Friends
+  card. **Join jam** joins the sync session, or opens/copies the request
+  playlist invite link.
+- If the friend is offline, the invite is delivered the next time they open
+  Spotify (for up to 12 hours).
+
+### Sending the invite
+
+Spotify has no public direct-message API, so FreeJam cannot post into Spotify's
+in-app messages for you. Instead, **Copy invite message** puts a ready-to-paste
+message on your clipboard containing:
+
+- what the jam is,
+- the `FJ1` join code or playlist invite link, and
+- your `FJF1` friend code.
+
+Paste that into a Spotify playlist comment, Discord, WhatsApp, SMS, or anywhere
+else. The other person pastes your friend code into FreeJam once; after that,
+alerts arrive automatically.
+
+### Privacy model
+
+Each user gets two random keys:
+
+| Key | Who has it | What it does |
+| --- | --- | --- |
+| `recvKey` | Only you | Authenticates your connection to your own mailbox. |
+| `sendKey` | Anyone you give your friend code to | Lets a friend deliver a jam alert to your mailbox. |
+
+Your friend code contains the `sendKey`, **not** the `recvKey`. A friend can
+send you a jam, but cannot read your mailbox or pretend to be you. The relay
+stores a mailbox per user id and forwards a jam only to that mailbox; it never
+broadcasts an invite to every FreeJam user. The extension also checks the
+sender against your local friend list, so a jam from someone you did not add is
+ignored even if it reaches the relay.
+
+Everyone must use the **same relay** for friend mailboxes to work. If you change
+the relay URL, copy your friend code again so friends can update it.
+
+---
+
 ## How sync behaves
 
 - **Host authoritative.** Guests never send state, only commands. The relay
@@ -236,13 +320,18 @@ Treat it like a room password.
 
 ## Security
 
-The relay is a dumb message forwarder. It is safe to run on a LAN or expose
-publicly behind TLS, as long as the join code is only shared with people you
-trust.
+The relay is a dumb message forwarder for playback and a mailbox for jam
+alerts. It is safe to run on a LAN or expose publicly behind TLS, as long as
+the join code and friend codes are only shared with people you trust.
 
 - The session key is a **room password**, not strong authentication.
 - Only a host can create a room, so a guest cannot squat a session id.
 - Only the host can broadcast state; only guests can send commands.
+- A friend code contains a mailbox **send key**, not the owner's private
+  receive key. It lets that friend send a jam alert, not read the mailbox.
+- A mailbox only accepts a DM whose send key matches the mailbox's registered
+  key. The extension additionally drops alerts from senders not in your local
+  friend list.
 - Messages are capped in size and rate-limited.
 - For use over the internet, terminate TLS in front of the relay (Render,
   Caddy, nginx, Cloudflare Tunnel, etc.) and give people a `wss://` URL.
@@ -256,6 +345,9 @@ trust.
   position every 500 ms. Very small seeks may be corrected by the host's next
   state broadcast; use the FreeJam slider for precise seeks.
 - Free accounts hear ads locally. Everyone re-converges after the ad.
+- Friend alerts need FreeJam on both devices and the same relay.
+- Spotify has no public direct-message API. FreeJam copies an invite message
+  for you to paste; it cannot post into Spotify's in-app messages.
 - The extension uses Spicetify's player APIs, so Spotify UI changes can require
   an update.
 
@@ -270,6 +362,10 @@ trust.
 | "Could not open the relay connection" | Check the relay URL, port, firewall, and whether the relay is running. |
 | Sync drifts | Click **Resync**; check the latency shown in the status line. |
 | Nothing queues in request mode | Keep Spotify open on the host, confirm the invite link is saved, and click **Check now**. |
+| Friend stays offline | Both devices must use the same relay URL, and the relay must be running the current `freejam-relay.js`. |
+| No jam alert from a friend | Add each other's `FJF1` codes, then start or resend the jam with **Send to friends**. |
+| "Different relay" warning | You and that friend created codes on different relays. Use the same relay and re-share the friend code. |
+| Friend alert does not arrive while offline | It is queued for up to 12 hours and delivered the next time they open Spotify with FreeJam. |
 
 ## Development
 
