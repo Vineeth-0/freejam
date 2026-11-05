@@ -33,6 +33,48 @@ not Spotify Jam.
 
 A **FreeJam** button appears in the playbar. Click it to open the panel.
 
+## Updating (automatic)
+
+The repo includes a `post-merge` hook that copies `freejam.js` into Spicetify,
+enables it if needed, and runs `spicetify apply` after every pull. Install the
+hook once:
+
+```powershell
+cd C:\Users\<your-name>\freejam
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-git-hooks.ps1
+```
+
+After that, updating is just:
+
+```powershell
+cd C:\Users\<your-name>\freejam
+git pull
+```
+
+The hook only runs when `freejam.js` changed, and `spicetify apply` restarts
+Spotify so the new version loads immediately. If you do not want Spotify to
+restart, set `FREEJAM_NO_RESTART=1` before pulling:
+
+```powershell
+$env:FREEJAM_NO_RESTART = "1"
+git pull
+```
+
+To preview what the hook would do:
+
+```powershell
+$env:FREEJAM_DRY_RUN = "1"
+git pull
+```
+
+The Pi relay is a separate machine. When `freejam-relay.js` changes, copy it to
+the Pi and restart the service:
+
+```bash
+scp freejam-relay.js pi@<pi-host>:~/freejam/
+ssh pi@<pi-host> "sudo systemctl restart freejam-relay"
+```
+
 ---
 
 ## Request mode (no guest install)
