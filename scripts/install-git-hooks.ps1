@@ -4,7 +4,7 @@ param()
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$hookNames = @("post-merge", "post-push")
+$hookNames = @("post-merge", "pre-push")
 
 if (-not (Test-Path -LiteralPath (Join-Path $repoRoot ".git"))) {
     throw "$repoRoot is not a git repository"
@@ -19,7 +19,7 @@ foreach ($hookName in $hookNames) {
     Copy-Item -LiteralPath $source -Destination $destination -Force
 }
 
-Write-Host "Installed post-merge and post-push hooks."
+Write-Host "Installed post-merge and pre-push hooks."
 Write-Host ""
 Write-Host "From now on, run:"
 Write-Host "  cd $repoRoot"
