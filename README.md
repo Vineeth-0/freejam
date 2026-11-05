@@ -57,8 +57,9 @@ git pull
 ```
 
 The hook only runs when `freejam.js` changed, and `spicetify apply` restarts
-Spotify so the new version loads immediately. If you do not want Spotify to
-restart, set `FREEJAM_NO_RESTART=1` before pulling:
+Spotify so the new version loads immediately. A `pre-push` hook does the same
+when you push from this repo. If you do not want Spotify to restart, set
+`FREEJAM_NO_RESTART=1` before pulling or pushing:
 
 ```powershell
 $env:FREEJAM_NO_RESTART = "1"
