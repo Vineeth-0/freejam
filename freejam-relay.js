@@ -9,11 +9,18 @@
  *   PORT=8787        Port to listen on.
  *   HOST=0.0.0.0     Interface to bind.
  *
- * The relay keeps one "room" per session id and forwards JSON messages to the
- * other participants in the same room. It never stores playback history.
+ * The relay does two jobs:
  *
- * Security: this is intended for a LAN, a private VPN, or a trusted deployment
- * behind TLS. The session key is a room password, not strong authentication.
+ *   1. Sync sessions. One "room" per session id forwards playback state and
+ *      commands between the host and guests. Nothing is stored.
+ *
+ *   2. Friend mailboxes. Each user owns a mailbox keyed by a random user id.
+ *      Friends send a jam invite directly to that mailbox using the owner's
+ *      shareable send key, so only people you added ever get an alert. The
+ *      relay never broadcasts an invite to everyone.
+ *
+ * Security: the session key and mailbox keys are shared secrets, not strong
+ * authentication. Run behind TLS.
  */
 
 "use strict";
@@ -29,9 +36,30 @@ const MAX_PAYLOAD = 64 * 1024;
 const MAX_BUFFER = 256 * 1024;
 const MAX_MESSAGES_PER_SECOND = 40;
 const MAX_CLIENTS_PER_ROOM = 32;
+const MAX_MAILBOX_CLIENTS = 8;
+const MAX_MAILBOXES = 10000;
+const MAX_JAM_AGE_MS = 12 * 60 * 60 * 1000;
+const MAX_PENDING_JAMS = 20;
+const MAX_WATCHED_USERS = 200;
 
 /** @type {Map<string, {key: string, clients: Set<Client>}>} */
 const rooms = new Map();
+
+/**
+ * Each user has a mailbox keyed by a stable user id. Friends send jam invites
+ * directly to that mailbox. The relay never broadcasts an invite to everyone.
+ *
+ * @type {Map<string, {recvKey: string, sendKey: string, clients: Set<Client>, lastJam: object|null}>}
+ */
+const mailboxes = new Map();
+
+/**
+ * A jam sent to a friend who is offline. It is delivered when they connect and
+ * prove they own the mailbox.
+ *
+ * @type {Map<string, {sk: string, jam: object, from: string, fromName: string, at: number}>}
+ */
+const pendingJams = new Map();
 
 class Client {
   constructor(socket, room, session, key, id, name, role) {
@@ -42,6 +70,9 @@ class Client {
     this.id = id;
     this.name = name;
     this.role = role;
+    this.kind = "session";
+    this.userId = "";
+    this.watching = new Set();
     this.buffer = Buffer.alloc(0);
     this.fragments = [];
     this.closed = false;
@@ -173,6 +204,169 @@ function broadcastPresence(room) {
   }
 }
 
+function mailboxOnline(userId) {
+  const box = mailboxes.get(userId);
+  return Boolean(box && box.clients.size > 0);
+}
+
+function sendPresence(client) {
+  const online = [];
+  for (const userId of client.watching) {
+    if (mailboxOnline(userId)) online.push(userId);
+  }
+  client.send({ t: "presence", online });
+}
+
+function notifyWatchers(userId) {
+  for (const box of mailboxes.values()) {
+    for (const client of box.clients) {
+      if (client.watching.has(userId)) sendPresence(client);
+    }
+  }
+}
+
+function buildJam(raw, client) {
+  if (!raw || typeof raw !== "object") return null;
+
+  const now = Date.now();
+  const mode = raw.mode === "request" ? "request" : "sync";
+  const jam = {
+    t: "jam",
+    mode,
+    hostName: safeString(raw.hostName, 64) || client.name,
+    joinCode: mode === "sync" ? safeString(raw.joinCode, 4096) : "",
+    sessionId: mode === "sync" ? safeString(raw.sessionId, 128) : "",
+    inviteUrl: mode === "request" ? safeString(raw.inviteUrl, 2048) : "",
+    expiresAt:
+      mode === "request"
+        ? Math.min(
+            Number(raw.expiresAt) || now + MAX_JAM_AGE_MS,
+            now + MAX_JAM_AGE_MS
+          )
+        : 0,
+    at: now,
+    from: client.userId,
+    fromName: client.name,
+  };
+
+  if (mode === "sync" && (!jam.joinCode || !jam.sessionId)) return null;
+  if (mode === "request" && !jam.inviteUrl) return null;
+  return jam;
+}
+
+function queuePending(userId, entry) {
+  let list = pendingJams.get(userId);
+  if (!list) {
+    list = [];
+    pendingJams.set(userId, list);
+  }
+
+  list.push(entry);
+
+  const cutoff = Date.now() - MAX_JAM_AGE_MS;
+  while (list.length > MAX_PENDING_JAMS) list.shift();
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    if (list[i].at < cutoff) list.splice(i, 1);
+  }
+}
+
+function deliverPending(client) {
+  const list = pendingJams.get(client.userId);
+  if (!list || !list.length) return;
+
+  const now = Date.now();
+  const box = client.room;
+
+  for (const entry of list) {
+    if (entry.at + MAX_JAM_AGE_MS <= now) continue;
+    // A pending invite is only valid if it was sent with the mailbox's current
+    // send key. This drops anything queued by someone who guessed the user id.
+    if (box.sendKey && entry.sk !== box.sendKey) continue;
+    if (
+      entry.jam.mode === "request" &&
+      entry.jam.expiresAt &&
+      entry.jam.expiresAt <= now
+    ) {
+      continue;
+    }
+    client.send(entry.jam);
+  }
+
+  pendingJams.delete(client.userId);
+}
+
+function handleMailboxMessage(client, message) {
+  if (message.t === "hello") {
+    const name = safeString(message.name, 64);
+    if (name) client.name = name;
+
+    // The recv key authenticated this connection, so the owner is allowed to
+    // (re)register their send key. This also repairs a mailbox that a stranger
+    // created before the owner first connected.
+    const sendKey = safeString(message.sendKey, 256);
+    if (sendKey) client.room.sendKey = sendKey;
+
+    client.send({
+      t: "hello-ok",
+      userId: client.userId,
+      sendKey: client.room.sendKey || "",
+    });
+    notifyWatchers(client.userId);
+    deliverPending(client);
+    return;
+  }
+
+  if (message.t === "watch") {
+    const ids = Array.isArray(message.ids) ? message.ids : [];
+    client.watching = new Set(
+      ids
+        .map((id) => safeString(id, 128))
+        .filter((id) => id && id !== client.userId)
+        .slice(0, MAX_WATCHED_USERS)
+    );
+    sendPresence(client);
+    return;
+  }
+
+  if (message.t === "dm") {
+    const to = safeString(message.to, 128);
+    const sendKey = safeString(message.sendKey, 256);
+    if (!to || !sendKey || to === client.userId) return;
+
+    let target = mailboxes.get(to);
+    if (!target) {
+      if (mailboxes.size >= MAX_MAILBOXES) return;
+      target = { recvKey: "", sendKey: "", clients: new Set(), lastJam: null };
+      mailboxes.set(to, target);
+    }
+    if (target.sendKey && target.sendKey !== sendKey) return;
+    if (!target.sendKey) target.sendKey = sendKey;
+
+    const jam = buildJam(message.jam, client);
+    if (!jam) return;
+    target.lastJam = jam;
+
+    if (target.clients.size > 0) {
+      for (const other of target.clients) other.send(jam);
+    } else {
+      queuePending(to, { sk: sendKey, jam, at: Date.now() });
+    }
+    return;
+  }
+
+  if (message.t === "jam-clear") {
+    const to = safeString(message.to, 128);
+    const sendKey = safeString(message.sendKey, 256);
+    const target = mailboxes.get(to);
+    if (!target || !target.sendKey || target.sendKey !== sendKey) return;
+
+    target.lastJam = null;
+    for (const other of target.clients) {
+      other.send({ t: "jam-clear", from: client.userId });
+    }
+  }
+}
+
 function handleMessage(client, raw) {
   if (raw.length > MAX_PAYLOAD) {
     client.close(1009, "Message too large");
@@ -211,6 +405,11 @@ function handleMessage(client, raw) {
     return;
   }
 
+  if (client.kind === "mailbox") {
+    handleMailboxMessage(client, message);
+    return;
+  }
+
   if (message.t === "hello") {
     const name = safeString(message.name, 64);
     const role = message.role === "host" ? "host" : "guest";
@@ -246,11 +445,14 @@ const server = http.createServer((req, res) => {
       [
         "FreeJam relay is running.",
         "",
-        "Point the FreeJam extension at this WebSocket URL, for example:",
+        "Sync sessions: point the FreeJam extension at this WebSocket URL, for",
+        "example:",
         `  ws://<this-machine-ip>:${PORT}`,
         "",
-        "Keep this process running while the listening session is active.",
-        "This relay does not store messages.",
+        "Friend mailboxes: friends send jam invites only to the mailboxes of",
+        "people who added them. Nothing is broadcast to everyone.",
+        "",
+        "Keep this process running while you use FreeJam.",
         "",
       ].join("\n")
     );
@@ -293,12 +495,13 @@ server.on("upgrade", (req, socket) => {
   }
 
   const session = safeString(url.searchParams.get("session"), 128);
+  const userId = safeString(url.searchParams.get("user"), 128);
   const roomKey = safeString(url.searchParams.get("key"), 256);
   const id = safeString(url.searchParams.get("id"), 64) || crypto.randomBytes(8).toString("hex");
   const name = safeString(url.searchParams.get("name"), 64) || "Listener";
-  const role = url.searchParams.get("role") === "host" ? "host" : "guest";
+  const isMailbox = Boolean(userId);
 
-  if (!session || !roomKey) {
+  if ((!isMailbox && !session) || !roomKey) {
     socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
     socket.destroy();
     return;
@@ -319,45 +522,110 @@ server.on("upgrade", (req, socket) => {
     ].join("\r\n")
   );
 
-  let room = rooms.get(session);
-  if (!room) {
-    // Only a host may create a room. Otherwise someone who learns or guesses a
-    // session id could lock the real host out by registering the room first.
-    if (role !== "host") {
-      const reject = new Client(socket, room, session, roomKey, id, name, role);
-      reject.close(4004, "Session not found");
+  let role;
+  let container;
+  let collection;
+  let collectionKey;
+  let client;
+  let sessionLabel;
+
+  if (isMailbox) {
+    role = "member";
+    sessionLabel = `mailbox:${userId}`;
+
+    let box = mailboxes.get(userId);
+    if (!box) {
+      box = { recvKey: roomKey, sendKey: "", clients: new Set(), lastJam: null };
+      mailboxes.set(userId, box);
+    } else if (box.recvKey && box.recvKey !== roomKey) {
+      const reject = new Client(
+        socket,
+        box,
+        sessionLabel,
+        roomKey,
+        id,
+        name,
+        role
+      );
+      reject.close(4003, "Invalid mailbox key");
+      return;
+    } else if (!box.recvKey) {
+      // A placeholder created by an incoming DM. The owner is now claiming it.
+      box.recvKey = roomKey;
+    } else if (box.clients.size >= MAX_MAILBOX_CLIENTS) {
+      const reject = new Client(
+        socket,
+        box,
+        sessionLabel,
+        roomKey,
+        id,
+        name,
+        role
+      );
+      reject.close(4009, "Mailbox has too many connections");
       return;
     }
-    room = { key: roomKey, clients: new Set() };
-    rooms.set(session, room);
-  } else if (room.key !== roomKey) {
-    const reject = new Client(socket, room, session, roomKey, id, name, role);
-    reject.close(4003, "Invalid session key");
-    return;
-  } else if (role !== "host" && room.clients.size >= MAX_CLIENTS_PER_ROOM) {
-    const reject = new Client(socket, room, session, roomKey, id, name, role);
-    reject.close(4009, "Session is full");
-    return;
-  }
 
-  // A reconnecting host replaces the previous host socket. The session key
-  // proves it is the same host, so this is safe.
-  if (role === "host") {
-    for (const other of room.clients) {
-      if (other.role === "host" && other.id !== id) {
-        other.close(4005, "Replaced by a new host");
+    container = box;
+    collection = mailboxes;
+    collectionKey = userId;
+    client = new Client(socket, box, sessionLabel, roomKey, id, name, role);
+    client.kind = "mailbox";
+    client.userId = userId;
+    box.clients.add(client);
+
+    console.log(
+      `[mailbox] ${userId.slice(0, 8)}… ${name} (${id}) — ${box.clients.size} connected`
+    );
+
+    notifyWatchers(userId);
+  } else {
+    role = url.searchParams.get("role") === "host" ? "host" : "guest";
+    sessionLabel = session;
+
+    let room = rooms.get(session);
+    if (!room) {
+      // Only a host may create a room. Otherwise someone who learns or guesses a
+      // session id could lock the real host out by registering the room first.
+      if (role !== "host") {
+        const reject = new Client(socket, room, session, roomKey, id, name, role);
+        reject.close(4004, "Session not found");
+        return;
+      }
+      room = { key: roomKey, clients: new Set() };
+      rooms.set(session, room);
+    } else if (room.key !== roomKey) {
+      const reject = new Client(socket, room, session, roomKey, id, name, role);
+      reject.close(4003, "Invalid session key");
+      return;
+    } else if (role !== "host" && room.clients.size >= MAX_CLIENTS_PER_ROOM) {
+      const reject = new Client(socket, room, session, roomKey, id, name, role);
+      reject.close(4009, "Session is full");
+      return;
+    }
+
+    // A reconnecting host replaces the previous host socket. The session key
+    // proves it is the same host, so this is safe.
+    if (role === "host") {
+      for (const other of room.clients) {
+        if (other.role === "host" && other.id !== id) {
+          other.close(4005, "Replaced by a new host");
+        }
       }
     }
+
+    container = room;
+    collection = rooms;
+    collectionKey = session;
+    client = new Client(socket, room, session, roomKey, id, name, role);
+    room.clients.add(client);
+
+    console.log(
+      `[join] ${session.slice(0, 8)}… ${role} ${name} (${id}) — ${room.clients.size} in room`
+    );
+
+    broadcastPresence(room);
   }
-
-  const client = new Client(socket, room, session, roomKey, id, name, role);
-  room.clients.add(client);
-
-  console.log(
-    `[join] ${session.slice(0, 8)}… ${role} ${name} (${id}) — ${room.clients.size} in room`
-  );
-
-  broadcastPresence(room);
 
   socket.on("data", (chunk) => {
     if (client.closed) return;
@@ -401,18 +669,21 @@ server.on("upgrade", (req, socket) => {
   });
 
   const cleanup = () => {
-    if (!room.clients.has(client)) return;
-    room.clients.delete(client);
+    if (!container.clients.has(client)) return;
+    container.clients.delete(client);
     client.closed = true;
 
     console.log(
-      `[leave] ${session.slice(0, 8)}… ${role} ${name} — ${room.clients.size} in room`
+      `[leave] ${sessionLabel.slice(0, 12)}… ${role} ${name} — ${container.clients.size} connected`
     );
 
-    if (room.clients.size === 0) {
-      rooms.delete(session);
+    if (isMailbox) {
+      // Keep the mailbox so its keys and last jam survive a reconnect.
+      notifyWatchers(userId);
+    } else if (container.clients.size === 0) {
+      collection.delete(collectionKey);
     } else {
-      broadcastPresence(room);
+      broadcastPresence(container);
     }
   };
 

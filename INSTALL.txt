@@ -65,12 +65,36 @@ Everyone installs FreeJam, and the host runs the small relay.
 
    FreeJam converts a pasted https:// address to wss:// automatically.
 
+C) FRIENDS AND JAM ALERTS
+-------------------------
+The Friends card sends an alert only to people you explicitly add. It does
+not notify everyone who installed the extension.
+
+1. Open the FreeJam panel and find the Friends card.
+2. Enter your name and the same public relay URL.
+3. Click "Create my friend code", then "Copy my code".
+4. Send that FJF1... code to a friend.
+5. Paste their FJF1... code into "Add a friend" and click "Add friend".
+6. When you start a sync or request session, FreeJam alerts only your added
+   friends. They can click "Join jam" in their panel.
+
+Your friend code contains a send key, not your private receive key, so a
+friend can send you a jam but cannot read your mailbox or impersonate you.
+Everyone must use the same relay for friend mailboxes.
+
+Spotify has no public direct-message API. Use "Copy invite message" to copy a
+ready-to-paste message with the jam link and your friend code, then paste it
+into Spotify, Discord, WhatsApp, SMS, etc.
+
 Notes
 -----
 - Sync mode needs FreeJam on every device. Request mode does not.
-- The relay never stores playback history.
+- The relay never stores playback history. It keeps a small mailbox per user
+  so an alert can be delivered when a friend is offline (up to 12 hours).
 - The session key inside the join code is a room password, not strong
   authentication. Only share it with people you trust.
+- Friend alerts require the current freejam-relay.js. Update the relay when
+  the extension is updated.
 
 See README.md for the full guide and DEPLOY.md for public relay
 setup (Render, Cloudflare Tunnel, VPS).

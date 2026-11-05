@@ -1,0 +1,168 @@
+FreeJam - friend install guide
+==============================
+
+You already have Spicetify installed. You only need to add the FreeJam
+extension and join the session.
+
+You do NOT need Node.js, the relay, or any of the host's server files.
+
+What's in this zip
+------------------
+freejam.js          the Spicetify extension
+INSTALL-FRIEND.txt  this file
+
+1. Unzip this file
+------------------
+Windows: right-click the zip -> Extract All.
+macOS: double-click the zip.
+
+You should end up with freejam.js in a normal folder.
+
+2. Copy freejam.js into your Spicetify Extensions folder
+--------------------------------------------------------
+Windows:
+  %APPDATA%\spicetify\Extensions
+
+  Paste that into the File Explorer address bar and press Enter. It usually
+  opens:
+    C:\Users\<your-name>\AppData\Roaming\spicetify\Extensions
+
+macOS / Linux:
+  ~/.config/spicetify/Extensions
+
+If the Extensions folder does not exist, create it.
+
+Put freejam.js directly inside that folder. Do not put it in a subfolder.
+
+3. Tell Spicetify to load the extension
+---------------------------------------
+Open this file in a text editor (Notepad is fine):
+
+  Windows:     %APPDATA%\spicetify\config-xpui.ini
+  macOS/Linux: ~/.config/spicetify/config-xpui.ini
+
+Find the section called:
+
+  [AdditionalOptions]
+
+Under it, find the line that starts with:
+
+  extensions =
+
+Set it to:
+
+  extensions = freejam.js
+
+If the line already lists other extensions, add freejam.js at the end,
+separated by a pipe character |. For example:
+
+  extensions = some-other-extension.js|freejam.js
+
+Save the file.
+
+4. Apply the extension
+----------------------
+Open a terminal:
+
+  Windows: PowerShell
+  macOS/Linux: Terminal
+
+Run:
+
+  spicetify apply
+
+If "spicetify" is not recognized, close and reopen the terminal and try
+again. If it still is not recognized, Spicetify is probably not on your
+PATH; reinstall Spicetify or run its full path.
+
+5. Fully restart Spotify
+------------------------
+Quit Spotify completely, including the tray icon on Windows or the menu-bar
+icon on macOS. Closing the window is not enough.
+
+Then reopen Spotify.
+
+You should now see a "FreeJam" button in the playbar at the bottom of the
+Spotify window.
+
+6. Join the session
+-------------------
+1. Click the FreeJam button.
+2. Paste the FJ1... join code the host sent you into the join field.
+3. Type your name.
+4. Click "Join sync".
+5. Wait for the status line to say "Following <host>".
+
+Important:
+- The host must have Spotify open and must have clicked "Start sync" first.
+- You do NOT need to paste the relay URL. The relay address is already
+  inside the FJ1... join code.
+- Copy the whole code, including the FJ1. prefix, with no extra spaces.
+
+7. Add the host as a friend (optional, but recommended)
+-------------------------------------------------------
+This is how you get an alert when the host starts a new jam, instead of
+having to ask for a code every time.
+
+1. Click the FreeJam button and find the "Friends" card.
+2. Enter your name and the same relay URL the host uses.
+3. Click "Create my friend code".
+4. Click "Copy my code" and send that FJF1... code to the host.
+5. Paste the host's FJF1... code into "Add a friend" and click "Add friend".
+
+After that, when the host starts a sync or request session, you get a
+Spotify notification and a "Join jam" button in your Friends card.
+
+Only people you both add can send each other alerts. FreeJam does not
+notify everyone who installed the extension.
+
+Spotify has no public direct-message API, so FreeJam cannot post into
+Spotify's in-app messages. Use "Copy invite message" to copy a ready-to-paste
+message with the jam link and your friend code, then paste it into Spotify,
+Discord, WhatsApp, SMS, etc.
+
+Troubleshooting
+---------------
+No FreeJam button:
+- Check that config-xpui.ini has "extensions = freejam.js" under
+  [AdditionalOptions].
+- Run "spicetify apply" again.
+- Fully quit Spotify and reopen it.
+
+"Session not found" or cannot connect:
+- The host may not have started the sync session yet.
+- The join code may be old. Ask the host for a fresh FJ1... code.
+- If the host is using a Cloudflare quick tunnel, the relay URL can change
+  after the host's Pi reboots. Ask for a new join code.
+
+Joined but no audio:
+- Check your Spotify output device and volume.
+- The host controls playback; your Spotify follows their playhead.
+
+"Invalid join code":
+- Make sure you copied the entire code, starting with FJ1.
+- Make sure there are no line breaks or spaces in the middle.
+
+Friend stays offline:
+- Both of you must use the same relay URL.
+- The host's relay must be running the current freejam-relay.js.
+- Ask the host to copy their friend code again after updating the relay.
+
+No jam alert:
+- Add each other's FJF1... codes.
+- Ask the host to click "Send to friends" on the active session.
+- If you were offline, the alert is delivered the next time you open
+  Spotify (for up to 12 hours).
+
+Spotify updated recently:
+- Run "spicetify apply" again, then fully restart Spotify.
+
+Notes
+-----
+- FreeJam works with free Spotify accounts. It does not bypass paywalls or
+  Premium checks.
+- The FJ1... code works like a room password. Do not post it publicly.
+- Your FJF1... friend code contains a send key, not your private receive key.
+  A friend can send you a jam but cannot read your mailbox or impersonate you.
+- Request mode (adding songs to a shared playlist) does not require this
+  extension at all.

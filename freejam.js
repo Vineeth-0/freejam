@@ -45,6 +45,13 @@
   const SYNC_TRACK_GRACE_MS = 4000;
   const SYNC_CMD_GRACE_MS = 1200;
 
+  const FRIENDS_STORAGE_KEY = "freejam:friends:v1";
+  const FRIEND_CODE_PREFIX = "FJF1.";
+  const FRIEND_PING_INTERVAL_MS = 15000;
+  const FRIEND_RECONNECT_MAX_MS = 15000;
+  const FRIEND_JAM_NOTIFY_COOLDOWN_MS = 45 * 1000;
+  const MAX_FRIENDS = 200;
+
   // ---------------------------------------------------------------------------
   // State
   // ---------------------------------------------------------------------------
@@ -119,6 +126,26 @@
     reconnectDelay: 1000,
     pingId: "",
     pingSentAt: 0,
+  };
+
+  const friends = {
+    identity: null,
+    list: [],
+    ws: null,
+    connected: false,
+    relayUrl: "",
+    selfId: "",
+    online: new Set(),
+    error: null,
+    reconnectTimer: null,
+    reconnectDelay: 1000,
+    pingTimer: null,
+    pingId: "",
+    pingSentAt: 0,
+    latencyMs: 0,
+    incomingJam: null,
+    pendingJam: null,
+    lastNotifyAt: 0,
   };
 
   // ---------------------------------------------------------------------------
@@ -338,6 +365,50 @@
     return value.replace(/\/+$/, "");
   }
 
+  function encodeFriendCode(identity) {
+    const payload = JSON.stringify({
+      v: 1,
+      u: identity.relayUrl,
+      id: identity.userId,
+      sk: identity.sendKey,
+      n: identity.name || "A friend",
+    });
+    return `${FRIEND_CODE_PREFIX}${base64UrlEncode(payload)}`;
+  }
+
+  function decodeFriendCode(code) {
+    if (!code) return null;
+    const value = String(code).trim();
+    if (!value.startsWith(FRIEND_CODE_PREFIX)) return null;
+    try {
+      const payload = JSON.parse(
+        base64UrlDecode(value.slice(FRIEND_CODE_PREFIX.length))
+      );
+      if (
+        !payload ||
+        payload.v !== 1 ||
+        typeof payload.u !== "string" ||
+        typeof payload.id !== "string" ||
+        typeof payload.sk !== "string" ||
+        !payload.u ||
+        !payload.id ||
+        !payload.sk
+      ) {
+        return null;
+      }
+      return {
+        relayUrl: normalizeRelayUrl(payload.u),
+        userId: payload.id,
+        sendKey: payload.sk,
+        name: typeof payload.n === "string" && payload.n.trim()
+          ? payload.n.trim().slice(0, 64)
+          : "A friend",
+      };
+    } catch {
+      return null;
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Persistence
   // ---------------------------------------------------------------------------
@@ -399,6 +470,81 @@
       Spicetify.LocalStorage.set(STORAGE_KEY, JSON.stringify(state));
     } catch (err) {
       console.warn("[FreeJam] Could not save session", err);
+    }
+  }
+
+  function loadFriends() {
+    try {
+      const raw = Spicetify.LocalStorage.get(FRIENDS_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!parsed || parsed.version !== 1) return;
+
+      const identity = parsed.identity;
+      if (
+        identity &&
+        typeof identity.userId === "string" &&
+        typeof identity.recvKey === "string" &&
+        typeof identity.sendKey === "string" &&
+        typeof identity.relayUrl === "string" &&
+        identity.userId &&
+        identity.recvKey &&
+        identity.sendKey
+      ) {
+        friends.identity = {
+          userId: identity.userId,
+          recvKey: identity.recvKey,
+          sendKey: identity.sendKey,
+          name: typeof identity.name === "string" ? identity.name : "Me",
+          relayUrl: normalizeRelayUrl(identity.relayUrl),
+          createdAt: Number(identity.createdAt) || Date.now(),
+        };
+      }
+
+      if (Array.isArray(parsed.list)) {
+        const seenIds = new Set();
+        friends.list = parsed.list
+          .filter(
+            (friend) =>
+              friend &&
+              typeof friend.userId === "string" &&
+              typeof friend.sendKey === "string" &&
+              friend.userId &&
+              friend.sendKey &&
+              !seenIds.has(friend.userId)
+          )
+          .slice(0, MAX_FRIENDS)
+          .map((friend) => {
+            seenIds.add(friend.userId);
+            return {
+              userId: friend.userId,
+              sendKey: friend.sendKey,
+              name:
+                typeof friend.name === "string" && friend.name.trim()
+                  ? friend.name.trim().slice(0, 64)
+                  : "A friend",
+              relayUrl: normalizeRelayUrl(friend.relayUrl || ""),
+              addedAt: Number(friend.addedAt) || Date.now(),
+            };
+          });
+      }
+    } catch (err) {
+      console.warn("[FreeJam] Could not load friends", err);
+    }
+  }
+
+  function saveFriends() {
+    try {
+      Spicetify.LocalStorage.set(
+        FRIENDS_STORAGE_KEY,
+        JSON.stringify({
+          version: 1,
+          identity: friends.identity,
+          list: friends.list,
+        })
+      );
+    } catch (err) {
+      console.warn("[FreeJam] Could not save friends", err);
     }
   }
 
@@ -760,6 +906,7 @@
       schedulePoll(600);
 
       if (invite && invite.url) {
+        announceJam();
         const copied = await copyText(invite.url);
         Spicetify.showNotification(
           copied
@@ -786,6 +933,7 @@
 
     const hadPlaylist = Boolean(state.playlistUrl);
     const lastRelayUrl = state.lastRelayUrl;
+    if (hadPlaylist) clearFriendsJam();
     sessionToken += 1;
     state = defaultState();
     state.lastRelayUrl = lastRelayUrl;
@@ -824,6 +972,7 @@
       state.inviteCreatedAt = Date.now();
       saveState();
       updatePanel(true);
+      announceJam();
       Spicetify.showNotification("New invite link created (valid for 7 days).");
     } finally {
       busy = false;
@@ -1607,6 +1756,7 @@
   }
 
   function leaveSync() {
+    if (sync.role === "host") clearFriendsJam();
     closeSyncSocket();
 
     sync.role = null;
@@ -1640,6 +1790,419 @@
 
     refreshSyncPanel();
     Spicetify.showNotification("Left the playback sync session.");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Friends: mailboxes and jam alerts
+  // ---------------------------------------------------------------------------
+
+  function friendIdentityName() {
+    return (
+      (friends.identity && friends.identity.name) ||
+      sync.name ||
+      "A friend"
+    );
+  }
+
+  function sendFriends(message) {
+    if (!friends.ws || friends.ws.readyState !== WebSocket.OPEN) return false;
+    try {
+      friends.ws.send(JSON.stringify(message));
+      return true;
+    } catch (err) {
+      console.warn("[FreeJam] Could not send a friend message", err);
+      return false;
+    }
+  }
+
+  function connectFriends() {
+    if (!friends.identity || !friends.identity.relayUrl) return;
+
+    closeFriendsSocket();
+    friends.selfId = randomId(8);
+    friends.error = null;
+    friends.relayUrl = friends.identity.relayUrl;
+
+    let url;
+    try {
+      url = new URL(friends.relayUrl);
+      url.searchParams.set("user", friends.identity.userId);
+      url.searchParams.set("key", friends.identity.recvKey);
+      url.searchParams.set("id", friends.selfId);
+      url.searchParams.set("name", friendIdentityName());
+    } catch {
+      friends.error = "Invalid relay URL.";
+      refreshFriendsPanel();
+      return;
+    }
+
+    let socket;
+    try {
+      socket = new WebSocket(url.toString());
+    } catch {
+      friends.error = "Could not open the relay connection.";
+      refreshFriendsPanel();
+      scheduleFriendsReconnect();
+      return;
+    }
+
+    friends.ws = socket;
+
+    socket.onopen = () => {
+      if (friends.ws !== socket) return;
+      friends.connected = true;
+      friends.error = null;
+      friends.reconnectDelay = 1000;
+
+      sendFriends({
+        t: "hello",
+        name: friendIdentityName(),
+        sendKey: friends.identity.sendKey,
+      });
+      watchFriends();
+      startFriendsPing();
+      flushPendingJam();
+      refreshFriendsPanel();
+    };
+
+    socket.onmessage = (event) => {
+      if (friends.ws !== socket) return;
+      let message;
+      try {
+        message = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      handleFriendsMessage(message);
+    };
+
+    socket.onerror = () => {
+      if (friends.ws !== socket) return;
+      friends.error = "Friend relay connection error.";
+      refreshFriendsPanel();
+    };
+
+    socket.onclose = (event) => {
+      if (friends.ws !== socket) return;
+      friends.connected = false;
+      friends.ws = null;
+      friends.online = new Set();
+      stopFriendsPing();
+
+      const code = event && Number(event.code);
+      if (code === 4003) {
+        friends.error =
+          "This friend identity belongs to another key. Recreate your friend code.";
+      } else if (code === 4009) {
+        friends.error = "Too many connections to your friend mailbox.";
+      }
+
+      refreshFriendsPanel();
+      if (friends.identity && code !== 4003) scheduleFriendsReconnect();
+    };
+  }
+
+  function closeFriendsSocket() {
+    clearTimeout(friends.reconnectTimer);
+    friends.reconnectTimer = null;
+    stopFriendsPing();
+
+    const socket = friends.ws;
+    friends.ws = null;
+    if (socket) {
+      socket.onopen = null;
+      socket.onmessage = null;
+      socket.onerror = null;
+      socket.onclose = null;
+      try {
+        socket.close();
+      } catch {
+        /* ignore */
+      }
+    }
+
+    friends.connected = false;
+    friends.online = new Set();
+  }
+
+  function scheduleFriendsReconnect() {
+    if (!friends.identity || !friends.identity.relayUrl) return;
+    clearTimeout(friends.reconnectTimer);
+
+    const delay = friends.reconnectDelay;
+    friends.reconnectTimer = setTimeout(() => {
+      friends.reconnectTimer = null;
+      if (friends.identity && !friends.connected) connectFriends();
+    }, delay);
+
+    friends.reconnectDelay = Math.min(
+      Math.round(friends.reconnectDelay * 1.7),
+      FRIEND_RECONNECT_MAX_MS
+    );
+  }
+
+  function startFriendsPing() {
+    stopFriendsPing();
+    friends.pingTimer = setInterval(() => {
+      if (!friends.connected) return;
+      friends.pingId = randomId(4);
+      friends.pingSentAt = Date.now();
+      sendFriends({ t: "ping", id: friends.pingId, ts: friends.pingSentAt });
+    }, FRIEND_PING_INTERVAL_MS);
+  }
+
+  function stopFriendsPing() {
+    clearInterval(friends.pingTimer);
+    friends.pingTimer = null;
+  }
+
+  function watchFriends() {
+    sendFriends({
+      t: "watch",
+      ids: friends.list.map((friend) => friend.userId),
+    });
+  }
+
+  function flushPendingJam() {
+    if (!friends.connected || !friends.pendingJam) return;
+    const jam = friends.pendingJam;
+    friends.pendingJam = null;
+    for (const friend of friends.list) {
+      sendFriends({
+        t: "dm",
+        to: friend.userId,
+        sendKey: friend.sendKey,
+        jam,
+      });
+    }
+  }
+
+  function buildLocalJam() {
+    if (sync.role === "host" && sync.sessionId) {
+      return {
+        mode: "sync",
+        hostName: friendIdentityName(),
+        joinCode: encodeJoinCode({
+          relayUrl: sync.relayUrl,
+          sessionId: sync.sessionId,
+          key: sync.key,
+        }),
+        sessionId: sync.sessionId,
+        inviteUrl: "",
+        expiresAt: 0,
+      };
+    }
+
+    if (state.playlistUri && state.inviteUrl) {
+      return {
+        mode: "request",
+        hostName: friendIdentityName(),
+        joinCode: "",
+        sessionId: "",
+        inviteUrl: state.inviteUrl,
+        expiresAt:
+          (state.inviteCreatedAt || Date.now()) + INVITE_TTL_MS,
+      };
+    }
+
+    return null;
+  }
+
+  function announceJam() {
+    if (!friends.identity) return false;
+
+    const jam = buildLocalJam();
+    if (!jam) return false;
+
+    friends.pendingJam = jam;
+    if (friends.connected) {
+      flushPendingJam();
+    } else if (friends.identity && friends.identity.relayUrl) {
+      connectFriends();
+    }
+
+    return friends.list.length > 0;
+  }
+
+  function clearFriendsJam() {
+    if (!friends.connected) return;
+    for (const friend of friends.list) {
+      sendFriends({
+        t: "jam-clear",
+        to: friend.userId,
+        sendKey: friend.sendKey,
+      });
+    }
+  }
+
+  function setIncomingJam(jam) {
+    friends.incomingJam = jam;
+    if (jam.mode === "request" && jam.expiresAt && jam.expiresAt <= Date.now()) {
+      friends.incomingJam = null;
+      return;
+    }
+
+    if (Date.now() - friends.lastNotifyAt >= FRIEND_JAM_NOTIFY_COOLDOWN_MS) {
+      friends.lastNotifyAt = Date.now();
+      const what =
+        jam.mode === "sync" ? "a playback sync" : "a listening session";
+      Spicetify.showNotification(
+        `${jam.fromName || "A friend"} started ${what}. Open FreeJam to join.`,
+        false,
+        8000
+      );
+    }
+
+    updateButton();
+    refreshFriendsPanel();
+  }
+
+  function clearIncomingJam() {
+    friends.incomingJam = null;
+    updateButton();
+    refreshFriendsPanel();
+  }
+
+  function handleFriendsMessage(message) {
+    if (!message || typeof message !== "object") return;
+
+    if (message.t === "hello-ok") {
+      if (
+        friends.identity &&
+        typeof message.sendKey === "string" &&
+        message.sendKey &&
+        message.sendKey !== friends.identity.sendKey
+      ) {
+        // The relay learned a different send key (for example a friend sent an
+        // invite before this device first connected). The recv key proves we
+        // own the mailbox, so re-register our key.
+        sendFriends({
+          t: "hello",
+          name: friendIdentityName(),
+          sendKey: friends.identity.sendKey,
+        });
+      }
+      flushPendingJam();
+      refreshFriendsPanel();
+      return;
+    }
+
+    if (message.t === "presence") {
+      friends.online = new Set(
+        Array.isArray(message.online) ? message.online : []
+      );
+      refreshFriendsPanel();
+      return;
+    }
+
+    if (message.t === "pong") {
+      if (message.id && message.id === friends.pingId) {
+        const rtt = Date.now() - (friends.pingSentAt || Date.now());
+        friends.latencyMs = Math.max(0, Math.min(500, Math.round(rtt / 2)));
+      }
+      return;
+    }
+
+    if (message.t === "jam") {
+      // Only accept jams from people this user explicitly added. This is the
+      // final guard: even if the relay forwarded something, it never reaches
+      // the UI unless the sender is in the local friend list.
+      const friend = friends.list.find(
+        (entry) => entry.userId === message.from
+      );
+      if (!friend) return;
+      setIncomingJam(message);
+      return;
+    }
+
+    if (message.t === "jam-clear") {
+      if (friends.incomingJam && friends.incomingJam.from === message.from) {
+        clearIncomingJam();
+      }
+      return;
+    }
+
+    if (message.t === "error") {
+      friends.error = String(message.message || "Friend relay error.");
+      refreshFriendsPanel();
+    }
+  }
+
+  function joinIncomingJam() {
+    const jam = friends.incomingJam;
+    if (!jam) return;
+
+    if (jam.mode === "sync") {
+      if (sync.role === "host") {
+        Spicetify.showNotification(
+          "Leave your own sync session before joining a friend's.",
+          true
+        );
+        return;
+      }
+
+      const config = decodeJoinCode(jam.joinCode);
+      if (!config) {
+        Spicetify.showNotification("This jam invite is invalid or expired.", true);
+        return;
+      }
+
+      sync.role = "guest";
+      sync.relayUrl = normalizeRelayUrl(config.relayUrl);
+      sync.sessionId = config.sessionId;
+      sync.key = config.key;
+      sync.name = sync.name || friendIdentityName();
+      sync.error = null;
+      sync.reconnectDelay = 1000;
+      state.lastRelayUrl = sync.relayUrl;
+      saveState();
+      connectSync();
+      refreshSyncPanel();
+      Spicetify.showNotification(`Joining ${jam.fromName || "your friend"}'s sync.`);
+      clearIncomingJam();
+      return;
+    }
+
+    if (jam.mode === "request") {
+      if (!jam.inviteUrl) {
+        Spicetify.showNotification("This invite link is missing.", true);
+        return;
+      }
+      copyText(jam.inviteUrl);
+      try {
+        window.open(jam.inviteUrl, "_blank");
+      } catch {
+        /* ignore */
+      }
+      Spicetify.showNotification(
+        "Invite link copied and opened. Add songs from the Spotify app.",
+        false,
+        6000
+      );
+      clearIncomingJam();
+    }
+  }
+
+  function friendInviteMessage() {
+    if (!friends.identity) return "";
+    const code = encodeFriendCode(friends.identity);
+    const jam = buildLocalJam();
+    const lines = [];
+
+    if (jam && jam.mode === "sync") {
+      lines.push(`${friendIdentityName()} is hosting a FreeJam playback sync.`);
+      lines.push(`Join code: ${jam.joinCode}`);
+    } else if (jam && jam.mode === "request") {
+      lines.push(`${friendIdentityName()} started a FreeJam listening session.`);
+      lines.push(`Add songs here: ${jam.inviteUrl}`);
+    } else {
+      lines.push(`${friendIdentityName()} invited you to FreeJam.`);
+    }
+
+    lines.push("");
+    lines.push(`Add me as a friend in FreeJam with this code:`);
+    lines.push(code);
+    return lines.join("\n");
   }
 
   // ---------------------------------------------------------------------------
@@ -1841,6 +2404,10 @@
       .fj-sync-status {
         background: rgba(255, 255, 255, 0.04);
       }
+      .fj-jam {
+        flex-wrap: wrap;
+        background: rgba(29, 185, 84, 0.12);
+      }
     `;
     document.head.appendChild(style);
   }
@@ -1938,6 +2505,7 @@
     actions.append(
       actionButton("open", "Open playlist", "secondary"),
       actionButton("regenerate", "New invite link", "secondary"),
+      actionButton("announceJam", "Send to friends", "secondary"),
       actionButton("retry", "Check now", "secondary"),
       actionButton(
         state.paused ? "resume" : "pause",
@@ -2052,6 +2620,9 @@
 
 
     const actions = el("div", "fj-actions");
+    if (sync.role === "host") {
+      actions.append(actionButton("announceJam", "Send to friends", "secondary"));
+    }
     if (sync.role === "guest") {
       actions.append(actionButton("syncResync", "Resync", "secondary"));
     }
@@ -2059,6 +2630,249 @@
     wrap.append(actions);
 
     return wrap;
+  }
+
+  function buildFriendsSetupCard() {
+    const wrap = el("div", "fj-card");
+
+    const head = el("div", "fj-card-head");
+    head.append(el("div", "fj-card-title", "Friends"));
+    head.append(el("span", "fj-badge off", "Setup"));
+    wrap.append(head);
+
+    wrap.append(
+      el(
+        "div",
+        "fj-hint",
+        "Add friends to get an alert when they start a jam. Only people you add can send you an invite — FreeJam never broadcasts to everyone."
+      )
+    );
+
+    const nameRow = el("div", "fj-row");
+    const nameInput = document.createElement("input");
+    nameInput.className = "fj-input fj-name";
+    nameInput.placeholder = "Your name";
+    nameInput.value = sync.name || "";
+    nameInput.dataset.fj = "friendName";
+    nameRow.append(nameInput);
+    wrap.append(nameRow);
+
+    const relayRow = el("div", "fj-row");
+    const relayInput = document.createElement("input");
+    relayInput.className = "fj-input";
+    relayInput.placeholder = "wss://your-relay.example.com";
+    relayInput.value = state.lastRelayUrl || sync.relayUrl || "";
+    relayInput.dataset.fj = "friendRelay";
+    const createButton = el("button", "fj-btn", "Create my friend code");
+    createButton.dataset.action = "friendsCreate";
+    relayRow.append(relayInput, createButton);
+    wrap.append(relayRow);
+
+    wrap.append(
+      el(
+        "div",
+        "fj-hint",
+        "Use the same public relay as your sync sessions. Friends need to reach it over the internet, so a wss:// URL is best."
+      )
+    );
+
+    return wrap;
+  }
+
+  function buildFriendRow(friend) {
+    const row = el("div", "fj-item");
+
+    const dot = el("span", "fj-dot");
+    if (!friends.online.has(friend.userId)) dot.classList.add("off");
+    row.append(dot);
+
+    const info = el("div", "fj-item-info");
+    info.append(el("div", "fj-item-name", friend.name));
+    info.append(
+      el(
+        "div",
+        "fj-item-meta",
+        friends.online.has(friend.userId) ? "online" : "offline"
+      )
+    );
+    row.append(info);
+
+    const remove = el("button", "fj-btn danger", "Remove");
+    remove.dataset.action = "friendsRemove";
+    remove.dataset.friendId = friend.userId;
+    row.append(remove);
+
+    return row;
+  }
+
+  function buildFriendsCard() {
+    const wrap = el("div", "fj-card");
+
+    const head = el("div", "fj-card-head");
+    head.append(el("div", "fj-card-title", "Friends"));
+
+    const onlineCount = friends.list.filter((friend) =>
+      friends.online.has(friend.userId)
+    ).length;
+    const badge = el(
+      "span",
+      "fj-badge",
+      friends.connected
+        ? `${onlineCount}/${friends.list.length} online`
+        : "Offline"
+    );
+    if (!friends.connected) badge.classList.add("off");
+    head.append(badge);
+    wrap.append(head);
+
+    const status = el("div", "fj-status fj-sync-status");
+    const statusDot = el("span", "fj-dot");
+    let statusText;
+    if (!friends.identity.relayUrl) {
+      statusDot.classList.add("off");
+      statusText = "Set a relay URL so friends can reach you.";
+    } else if (!friends.connected) {
+      statusDot.classList.add("off");
+      statusText = friends.error || "Connecting to the friend relay…";
+    } else {
+      const latency = friends.latencyMs ? `${friends.latencyMs}ms` : "measuring";
+      statusText = `Connected · ${onlineCount} of ${friends.list.length} friends online · ${latency}`;
+    }
+    status.append(statusDot, el("span", null, statusText));
+    wrap.append(status);
+
+    const relayRow = el("div", "fj-row");
+    const relayInput = document.createElement("input");
+    relayInput.className = "fj-input";
+    relayInput.placeholder = "wss://your-relay.example.com";
+    relayInput.value = friends.identity.relayUrl || "";
+    relayInput.dataset.fj = "friendRelayEdit";
+    const saveRelay = el("button", "fj-btn secondary", "Save relay");
+    saveRelay.dataset.action = "friendsSaveRelay";
+    relayRow.append(relayInput, saveRelay);
+    wrap.append(relayRow);
+
+    const jam = friends.incomingJam;
+    if (jam) {
+      const box = el("div", "fj-status fj-jam");
+      box.append(el("span", "fj-dot"));
+      const info = el("div", "fj-item-info");
+      info.append(
+        el(
+          "div",
+          "fj-item-name",
+          `${jam.fromName || "A friend"} · ${
+            jam.mode === "sync" ? "playback sync" : "listening session"
+          }`
+        )
+      );
+      info.append(el("div", "fj-item-meta", timeAgo(jam.at || Date.now())));
+      box.append(info);
+
+      const join = el("button", "fj-btn", "Join jam");
+      join.dataset.action = "friendsJoin";
+      const dismiss = el("button", "fj-btn secondary", "Dismiss");
+      dismiss.dataset.action = "friendsDismiss";
+      box.append(join, dismiss);
+      wrap.append(box);
+    }
+
+    const codeRow = el("div", "fj-row");
+    const codeInput = document.createElement("input");
+    codeInput.className = "fj-input fj-mono";
+    codeInput.readOnly = true;
+    codeInput.value = encodeFriendCode(friends.identity);
+    codeInput.dataset.fj = "friendCode";
+    codeInput.addEventListener("focus", () => codeInput.select());
+    const copyCode = el("button", "fj-btn", "Copy my code");
+    copyCode.dataset.action = "friendsCopyCode";
+    codeRow.append(codeInput, copyCode);
+    wrap.append(codeRow);
+
+    const actions = el("div", "fj-actions");
+    actions.append(
+      actionButton("friendsCopyMessage", "Copy invite message", "secondary")
+    );
+    if (!friends.connected && friends.identity.relayUrl) {
+      actions.append(
+        actionButton("friendsReconnect", "Reconnect", "secondary")
+      );
+    }
+    wrap.append(actions);
+
+    wrap.append(el("div", "fj-divider"));
+    wrap.append(el("div", "fj-subtitle", "Add a friend"));
+
+    const addRow = el("div", "fj-row");
+    const addInput = document.createElement("input");
+    addInput.className = "fj-input fj-mono";
+    addInput.placeholder = "Paste their FJF1 friend code";
+    addInput.dataset.fj = "friendCodeInput";
+    const addButton = el("button", "fj-btn", "Add friend");
+    addButton.dataset.action = "friendsAdd";
+    addRow.append(addInput, addButton);
+    wrap.append(addRow);
+
+    const list = el("div", "fj-list");
+    if (friends.list.length === 0) {
+      list.append(
+        el(
+          "div",
+          "fj-empty",
+          "No friends yet. Send them your code, then paste theirs here."
+        )
+      );
+    } else {
+      for (const friend of friends.list) {
+        list.append(buildFriendRow(friend));
+      }
+    }
+    wrap.append(list);
+
+    wrap.append(
+      el(
+        "div",
+        "fj-hint",
+        "Your code contains a send key, not your private receive key. Friends can send you jams, but cannot read your mailbox or impersonate you."
+      )
+    );
+
+    return wrap;
+  }
+
+  function renderFriendsSection(container) {
+    if (!container) return;
+
+    const key = [
+      friends.identity ? "id" : "none",
+      friends.identity ? friends.identity.relayUrl : "",
+      friends.connected ? "on" : "off",
+      friends.error || "",
+      friends.list.map((friend) => `${friend.userId}:${friend.name}`).join(","),
+      Array.from(friends.online).sort().join(","),
+      friends.incomingJam
+        ? `${friends.incomingJam.from}|${friends.incomingJam.at}|${friends.incomingJam.mode}`
+        : "",
+    ].join("|");
+
+    if (container.dataset.renderKey === key) return;
+    container.dataset.renderKey = key;
+    container.replaceChildren(
+      friends.identity ? buildFriendsCard() : buildFriendsSetupCard()
+    );
+  }
+
+  function refreshFriendsPanel() {
+    updateButton();
+
+    const root = ui.root;
+    if (!root || !root.isConnected) return;
+
+    const container = $('[data-fj="friends"]', root);
+    if (!container) return;
+
+    container.dataset.renderKey = "";
+    renderFriendsSection(container);
   }
 
   function renderSyncSection(container) {
@@ -2141,10 +2955,14 @@
   function updateButton() {
     if (!ui.button) return;
 
-    const active = Boolean(state.playlistUri || sync.role);
+    const active = Boolean(state.playlistUri || sync.role || friends.incomingJam);
     ui.button.active = active;
 
-    if (state.playlistUri) {
+    if (friends.incomingJam) {
+      ui.button.label = `FreeJam — join ${
+        friends.incomingJam.fromName || "a friend"
+      }'s jam`;
+    } else if (state.playlistUri) {
       ui.button.label = `FreeJam — ${
         state.paused ? "paused" : "listening"
       }${state.requests.length ? ` (${state.requests.length})` : ""}`;
@@ -2167,6 +2985,7 @@
     const status = $('[data-fj="status"]', root);
     const session = $('[data-fj="session"]', root);
     const syncContainer = $('[data-fj="sync"]', root);
+    const friendsContainer = $('[data-fj="friends"]', root);
     const count = $('[data-fj="count"]', root);
     const now = $('[data-fj="now"]', root);
     const list = $('[data-fj="requests"]', root);
@@ -2219,6 +3038,7 @@
     }
 
     if (syncContainer) renderSyncSection(syncContainer);
+    if (friendsContainer) renderFriendsSection(friendsContainer);
 
     if (now) {
       now.replaceChildren();
@@ -2277,6 +3097,7 @@
       <div class="fj-status" data-fj="status"></div>
       <div data-fj="session"></div>
       <div data-fj="sync"></div>
+      <div data-fj="friends"></div>
       <div class="fj-card">
         <div class="fj-card-head">
           <span class="fj-card-title">Recent requests</span>
@@ -2374,6 +3195,201 @@
         case "saveInvite":
           savePastedInvite();
           break;
+        case "announceJam": {
+          if (!friends.identity) {
+            Spicetify.showNotification(
+              "Create your friend code first, then add a friend.",
+              true
+            );
+            return;
+          }
+          if (!friends.list.length) {
+            Spicetify.showNotification(
+              "Add at least one friend before sending a jam invite.",
+              true
+            );
+            return;
+          }
+          const jam = buildLocalJam();
+          if (!jam) {
+            Spicetify.showNotification(
+              "Start a sync session or a request session first.",
+              true
+            );
+            return;
+          }
+          announceJam();
+          Spicetify.showNotification(
+            friends.connected
+              ? "Jam invite sent to your friends."
+              : "Jam invite queued. It will send when the friend relay reconnects."
+          );
+          break;
+        }
+        case "friendsCreate": {
+          const nameInput = $('[data-fj="friendName"]', ui.root);
+          const relayInput = $('[data-fj="friendRelay"]', ui.root);
+          const relayUrl = normalizeRelayUrl(relayInput ? relayInput.value : "");
+          if (!relayUrl) {
+            Spicetify.showNotification(
+              "Enter the relay URL friends can reach, for example wss://your-relay.example.com.",
+              true
+            );
+            return;
+          }
+
+          const name =
+            (nameInput && nameInput.value.trim()) ||
+            sync.name ||
+            "Me";
+
+          if (friends.identity) {
+            friends.identity.name = name;
+            friends.identity.relayUrl = relayUrl;
+          } else {
+            friends.identity = {
+              userId: randomId(12),
+              recvKey: randomId(24),
+              sendKey: randomId(24),
+              name,
+              relayUrl,
+              createdAt: Date.now(),
+            };
+          }
+
+          state.lastRelayUrl = relayUrl;
+          saveFriends();
+          saveState();
+          friends.reconnectDelay = 1000;
+          connectFriends();
+          refreshFriendsPanel();
+          Spicetify.showNotification(
+            "Friend code ready. Copy it and send it to the people you trust."
+          );
+          break;
+        }
+        case "friendsCopyCode": {
+          if (!friends.identity) return;
+          const code = encodeFriendCode(friends.identity);
+          const ok = await copyText(code);
+          Spicetify.showNotification(
+            ok ? "Friend code copied." : "Could not copy the friend code.",
+            !ok
+          );
+          break;
+        }
+        case "friendsCopyMessage": {
+          if (!friends.identity) return;
+          const message = friendInviteMessage();
+          const ok = await copyText(message);
+          Spicetify.showNotification(
+            ok
+              ? "Invite message copied. Paste it in Spotify, Discord, or anywhere else."
+              : "Could not copy the invite message.",
+            !ok
+          );
+          break;
+        }
+        case "friendsAdd": {
+          const input = $('[data-fj="friendCodeInput"]', ui.root);
+          const code = decodeFriendCode(input ? input.value : "");
+          if (!code) {
+            Spicetify.showNotification(
+              "Paste a valid FJF1 friend code.",
+              true
+            );
+            return;
+          }
+          if (friends.identity && code.userId === friends.identity.userId) {
+            Spicetify.showNotification("That is your own friend code.", true);
+            return;
+          }
+
+          const existing = friends.list.find(
+            (friend) => friend.userId === code.userId
+          );
+          if (existing) {
+            existing.sendKey = code.sendKey;
+            existing.name = code.name;
+          } else {
+            if (friends.list.length >= MAX_FRIENDS) {
+              Spicetify.showNotification("The friend list is full.", true);
+              return;
+            }
+            friends.list.push({
+              userId: code.userId,
+              sendKey: code.sendKey,
+              name: code.name,
+              relayUrl: code.relayUrl,
+              addedAt: Date.now(),
+            });
+          }
+
+          saveFriends();
+          watchFriends();
+          refreshFriendsPanel();
+
+          if (
+            friends.identity &&
+            friends.identity.relayUrl &&
+            code.relayUrl &&
+            code.relayUrl !== friends.identity.relayUrl
+          ) {
+            Spicetify.showNotification(
+              `${code.name} added. Note: they use a different relay, so invites may not deliver until you both use the same relay.`,
+              true,
+              9000
+            );
+          } else {
+            Spicetify.showNotification(`${code.name} added.`);
+          }
+          break;
+        }
+        case "friendsRemove": {
+          const id = button.dataset.friendId;
+          if (!id) return;
+          friends.list = friends.list.filter(
+            (friend) => friend.userId !== id
+          );
+          saveFriends();
+          watchFriends();
+          refreshFriendsPanel();
+          break;
+        }
+        case "friendsJoin":
+          joinIncomingJam();
+          break;
+        case "friendsDismiss":
+          clearIncomingJam();
+          break;
+        case "friendsReconnect":
+          friends.error = null;
+          friends.reconnectDelay = 1000;
+          connectFriends();
+          refreshFriendsPanel();
+          break;
+        case "friendsSaveRelay": {
+          const input = $('[data-fj="friendRelayEdit"]', ui.root);
+          const relayUrl = normalizeRelayUrl(input ? input.value : "");
+          if (!relayUrl) {
+            Spicetify.showNotification("Enter a valid relay URL.", true);
+            return;
+          }
+          if (!friends.identity) return;
+
+          friends.identity.relayUrl = relayUrl;
+          state.lastRelayUrl = relayUrl;
+          saveFriends();
+          saveState();
+          friends.error = null;
+          friends.reconnectDelay = 1000;
+          connectFriends();
+          refreshFriendsPanel();
+          Spicetify.showNotification(
+            "Friend relay updated. Copy your friend code again so friends can update it."
+          );
+          break;
+        }
         case "end": {
           if (Date.now() > endArmedUntil) {
             endArmedUntil = Date.now() + 4000;
@@ -2409,6 +3425,7 @@
           state.lastRelayUrl = relayUrl;
           saveState();
           connectSync();
+          announceJam();
           refreshSyncPanel();
           break;
         }
@@ -2570,6 +3587,7 @@
     }
 
     loadState();
+    loadFriends();
     injectStyles();
     createPlaybarButton();
     registerContextMenu();
@@ -2597,6 +3615,12 @@
       setTimeout(() => {
         if (sync.role && !sync.connected) connectSync();
       }, 1200);
+    }
+
+    if (friends.identity && friends.identity.relayUrl) {
+      setTimeout(() => {
+        if (friends.identity && !friends.connected) connectFriends();
+      }, 1800);
     }
   })();
 })();
