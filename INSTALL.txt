@@ -1,0 +1,76 @@
+FreeJam — quick install
+=======================
+
+FreeJam is a Spicetify extension for shared listening on free Spotify
+accounts. It does NOT bypass paywalls and does NOT use Spotify's Premium-only
+Jam API.
+
+There are two ways to use it:
+
+A) REQUEST MODE (nothing to install for your friends)
+-----------------------------------------------------
+Only the host installs FreeJam. The host clicks "Start session", then sends
+the copied Spotify invite link. Friends open that link in the normal Spotify
+app, accept the collaborator invite, and add songs. New songs are queued on
+the host's device.
+
+B) SYNC MODE (FreeJam on every participant)
+-------------------------------------------
+Everyone installs FreeJam, and the host runs the small relay.
+
+1. Install Spicetify if you have not already:
+   https://spicetify.app/docs/getting-started
+
+2. Put freejam.js in your Spicetify Extensions folder:
+   - Windows: %APPDATA%\spicetify\Extensions
+   - macOS/Linux: ~/.config/spicetify/Extensions
+
+3. Open config-xpui.ini in the spicetify folder and make sure the
+   extensions line includes freejam.js, for example:
+
+   [AdditionalOptions]
+   extensions = freejam.js
+
+4. Run:
+   spicetify apply
+
+5. Restart Spotify. A "FreeJam" button appears in the playbar.
+
+6. SYNC MODE ONLY — the host runs the relay (Node.js 18+):
+
+   node freejam-relay.js
+
+   That listens on port 8787. If everyone is on the same Wi-Fi, the
+   address it prints (ws://192.168.x.x:8787) is enough.
+
+   For friends on other networks, the relay must be reachable over the
+   public internet with TLS. Do NOT use a plain ws:// or LAN address.
+   Two easy free options (full steps in DEPLOY.md):
+
+   a) Render — free, stable URL, no server of your own:
+      Deploy the FreeJam-deploy folder as a Node web service, then use:
+        wss://your-service.onrender.com
+
+   b) Cloudflare Quick Tunnel — no account, temporary URL:
+        node freejam-relay.js
+        cloudflared tunnel --url http://localhost:8787
+      Cloudflare prints an https://....trycloudflare.com URL. Use it as:
+        wss://....trycloudflare.com
+      Keep both commands running while you listen. The URL changes each
+      time you restart the tunnel.
+
+   Host: open FreeJam, paste the wss:// address, click "Start sync",
+   copy the FJ1... join code and send it to your friend.
+   Guest: open FreeJam, paste the FJ1... code, click "Join sync".
+
+   FreeJam converts a pasted https:// address to wss:// automatically.
+
+Notes
+-----
+- Sync mode needs FreeJam on every device. Request mode does not.
+- The relay never stores playback history.
+- The session key inside the join code is a room password, not strong
+  authentication. Only share it with people you trust.
+
+See README.md for the full guide and DEPLOY.md for public relay
+setup (Render, Cloudflare Tunnel, VPS).
