@@ -1841,21 +1841,6 @@
       .fj-sync-status {
         background: rgba(255, 255, 255, 0.04);
       }
-      .fj-sync-buttons {
-        flex-wrap: wrap;
-      }
-      .fj-seek-row {
-        gap: 10px;
-      }
-      .fj-seek {
-        flex: 1 1 auto;
-        min-width: 0;
-        accent-color: var(--spice-button, #1db954);
-      }
-      .fj-time {
-        flex: 0 0 auto;
-        color: var(--spice-subtext, #b3b3b3);
-      }
     `;
     document.head.appendChild(style);
   }
@@ -1889,7 +1874,7 @@
       el(
         "div",
         "fj-hint",
-        "Using an existing playlist snapshots its current songs, so only new additions get queued."
+        "Request sessions use a collaborative playlist as a shared inbox. Starting one creates it for you; guests add songs there and this device queues new additions. Use an existing playlist if you already have one. Playback sync is separate and does not need a playlist."
       )
     );
 
@@ -1978,7 +1963,7 @@
       el(
         "div",
         "fj-hint",
-        "Keeps everyone's playhead together and forwards skips, seeks and play/pause to the host. Every participant needs FreeJam. Run freejam-relay.js on the host or deploy it somewhere reachable."
+        "Playback sync follows the host through a relay. Everyone needs FreeJam and access to the relay. Use Spotify's normal player controls for play, pause, skipping and seeking. Sync mode does not need a playlist."
       )
     );
 
@@ -2065,31 +2050,6 @@
       );
     }
 
-    const controls = el("div", "fj-sync-controls");
-    controls.dataset.fj = "syncControls";
-
-    const buttons = el("div", "fj-row fj-sync-buttons");
-    buttons.append(
-      actionButton("syncPrev", "Previous", "secondary"),
-      actionButton("syncToggle", "Play", "secondary"),
-      actionButton("syncNext", "Next", "secondary")
-    );
-    controls.append(buttons);
-
-    const seekRow = el("div", "fj-row fj-seek-row");
-    const seek = document.createElement("input");
-    seek.type = "range";
-    seek.min = "0";
-    seek.max = "1000";
-    seek.step = "1";
-    seek.value = "0";
-    seek.className = "fj-seek";
-    seek.dataset.fj = "syncSeek";
-    const timeLabel = el("span", "fj-mono fj-time", "0:00 / 0:00");
-    timeLabel.dataset.fj = "syncTime";
-    seekRow.append(seek, timeLabel);
-    controls.append(seekRow);
-    wrap.append(controls);
 
     const actions = el("div", "fj-actions");
     if (sync.role === "guest") {
@@ -2120,9 +2080,6 @@
     if (!root || !root.isConnected || !sync.role) return;
 
     const status = $('[data-fj="syncStatus"]', root);
-    const toggle = root.querySelector('[data-action="syncToggle"]');
-    const seek = $('[data-fj="syncSeek"]', root);
-    const time = $('[data-fj="syncTime"]', root);
 
     if (status) {
       status.replaceChildren();
@@ -2151,26 +2108,6 @@
       status.append(dot, el("span", null, text));
     }
 
-    if (toggle) {
-      toggle.textContent = isLocalPlaying() ? "Pause" : "Play";
-    }
-
-    if (seek) {
-      const local =
-        Spicetify.Player.origin && Spicetify.Player.origin._state;
-      const duration = (local && Number(local.duration)) || 0;
-      const position = getLocalPosition();
-
-      if (!sync.seeking && duration > 0) {
-        seek.value = String(
-          Math.max(0, Math.min(1000, Math.round((position / duration) * 1000)))
-        );
-      }
-
-      if (time) {
-        time.textContent = `${formatMs(position)} / ${formatMs(duration)}`;
-      }
-    }
   }
 
   function refreshSyncPanel() {
@@ -2322,13 +2259,13 @@
     if (hint) {
       if (!state.playlistUri && sync.role) {
         hint.textContent =
-          "Sync mode is active. Use the controls above, or start a request playlist to let guests add songs without installing FreeJam.";
+          "Sync mode is active. Use Spotify's normal player controls to control playback. Start a request session only if you also want guests to add songs to a playlist.";
       } else if (state.playlistUri) {
         hint.textContent =
           "Guests open the invite link in the Spotify desktop or mobile app, then add songs to the request playlist. This device queues them automatically. Invite links expire after 7 days.";
       } else {
         hint.textContent =
-          "FreeJam creates a normal collaborative playlist and watches it for new songs. It never calls Spotify's Premium-only Jam APIs.";
+          "Request sessions use a collaborative playlist as a shared inbox for song requests; FreeJam creates one automatically, or you can choose an existing playlist. Playback sync is a separate relay mode and does not need a playlist. Use Spotify's normal player controls.";
       }
     }
   }
@@ -2351,8 +2288,6 @@
       <div class="fj-hint" data-fj="hint"></div>
     `;
     root.addEventListener("click", onPanelClick);
-    root.addEventListener("input", onPanelInput);
-    root.addEventListener("change", onPanelChange);
 
     ui.root = root;
     Spicetify.PopupModal.display({
@@ -2363,90 +2298,6 @@
     // The popup must be attached before updatePanel() runs: it deliberately
     // skips work for detached roots so a closed modal does not keep rendering.
     updatePanel();
-  }
-
-  function onPanelInput(event) {
-    const target = event.target;
-    if (!(target instanceof Element)) return;
-
-    if (target.matches('[data-fj="syncSeek"]')) {
-      sync.seeking = true;
-      const local = Spicetify.Player.origin && Spicetify.Player.origin._state;
-      const duration = (local && Number(local.duration)) || 0;
-      const ratio = Number(target.value) / 1000;
-      const time = $('[data-fj="syncTime"]', ui.root);
-      if (time) {
-        time.textContent = `${formatMs(ratio * duration)} / ${formatMs(
-          duration
-        )}`;
-      }
-    }
-  }
-
-  function onPanelChange(event) {
-    const target = event.target;
-    if (!(target instanceof Element)) return;
-
-    if (target.matches('[data-fj="syncSeek"]')) {
-      sync.seeking = false;
-      const local = Spicetify.Player.origin && Spicetify.Player.origin._state;
-      const duration = (local && Number(local.duration)) || 0;
-      const value = Math.round((Number(target.value) / 1000) * duration);
-      applySeek(value);
-    }
-  }
-
-  function applyToggle() {
-    const playing = isLocalPlaying();
-
-    if (sync.role === "host") {
-      if (playing) Spicetify.Player.pause();
-      else Spicetify.Player.play();
-      setTimeout(() => broadcastState(true), 100);
-    } else if (sync.role === "guest") {
-      cancelPendingApply();
-      const sent = sendCommand(playing ? "pause" : "play");
-      if (playing) Spicetify.Player.pause();
-      else Spicetify.Player.play();
-      if (sent) sync.applyingUntil = Date.now() + 1200;
-    }
-  }
-
-  function applySkip(direction) {
-    const isNext = direction === "next";
-
-    if (sync.role === "host") {
-      if (isNext) Spicetify.Player.next();
-      else Spicetify.Player.back();
-      setTimeout(() => broadcastState(true), 200);
-    } else if (sync.role === "guest") {
-      // Skip locally, then let songchange tell the host the exact URI we
-      // landed on. Sending a blind "next" would break previous/back.
-      cancelPendingApply();
-      sync.manualSkipAt = Date.now();
-      sync.applyingUntil = 0;
-      sync.expectedUntil = 0;
-      if (isNext) Spicetify.Player.next();
-      else Spicetify.Player.back();
-    }
-  }
-
-  function applySeek(value) {
-    const position = Math.max(0, Math.round(Number(value) || 0));
-
-    if (sync.role === "host") {
-      Spicetify.Player.seek(position);
-      setTimeout(() => broadcastState(true), 150);
-    } else if (sync.role === "guest") {
-      cancelPendingApply();
-      const sent = sendCommand("seek", position);
-      try {
-        Spicetify.Player.seek(position);
-      } catch (err) {
-        console.warn("[FreeJam] Could not seek locally", err);
-      }
-      if (sent) sync.applyingUntil = Date.now() + 1200;
-    }
   }
 
   async function onPanelClick(event) {
@@ -2599,15 +2450,6 @@
           );
           break;
         }
-        case "syncPrev":
-          applySkip("prev");
-          break;
-        case "syncNext":
-          applySkip("next");
-          break;
-        case "syncToggle":
-          applyToggle();
-          break;
         case "syncResync": {
           if (sync.role !== "guest" || !sync.connected) {
             Spicetify.showNotification("Not connected to a sync session.", true);
