@@ -2263,6 +2263,15 @@
         cursor: pointer;
         font-weight: 700;
         list-style-position: inside;
+        min-height: 44px;
+        display: flex;
+        align-items: center;
+      }
+      .fj-section > summary:focus-visible,
+      .fj-btn:focus-visible,
+      .fj-input:focus-visible {
+        outline: 3px solid #7fc8ff;
+        outline-offset: 2px;
       }
       .fj-section-body { padding: 0 10px 10px; }
       .fj-section[open] > summary { margin-bottom: 8px; }
@@ -2351,7 +2360,7 @@
         font: inherit;
       }
       .fj-input:focus {
-        border-color: rgba(255, 255, 255, 0.4);
+        border-color: #7fc8ff;
       }
       .fj-name {
         flex: 0 1 140px;
@@ -2362,7 +2371,8 @@
       }
       .fj-btn {
         flex: 0 0 auto;
-        padding: 9px 16px;
+        min-height: 44px;
+        padding: 10px 16px;
         border: 0;
         border-radius: 999px;
         cursor: pointer;
@@ -2449,6 +2459,16 @@
       .fj-jam {
         flex-wrap: wrap;
         background: rgba(29, 185, 84, 0.12);
+      }
+      @media (max-width: 480px) {
+        .fj-root { padding: 0 12px 16px; gap: 10px; }
+        .fj-row { flex-wrap: wrap; }
+        .fj-row > .fj-btn { flex: 1 1 auto; }
+        .fj-input { min-height: 44px; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .fj-btn { transition: none; }
+        .fj-btn:active { transform: none; }
       }
     `;
     document.head.appendChild(style);
@@ -3138,6 +3158,11 @@
           "Request sessions use a collaborative playlist as a shared inbox for song requests; FreeJam creates one automatically, or you can choose an existing playlist. Playback sync is a separate relay mode and does not need a playlist. Use Spotify's normal player controls.";
       }
     }
+    root.querySelectorAll("input").forEach((input) => {
+      if (!input.hasAttribute("aria-label") && input.placeholder) {
+        input.setAttribute("aria-label", input.placeholder);
+      }
+    });
   }
 
   function openPanel() {
