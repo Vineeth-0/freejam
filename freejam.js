@@ -3709,13 +3709,13 @@
               alerts.os = false;
               saveAlerts();
               refreshSettingsPanel();
-              if (notificationPermission() === "denied") {
-                Spicetify.showNotification(
-                  "Allow notifications for Spotify in your system settings, then turn this on again.",
-                  true,
-                  9000
-                );
-              }
+              Spicetify.showNotification(
+                notificationPermission() === "denied"
+                  ? "Allow notifications for Spotify in your system settings, then turn this on again."
+                  : "Spotify did not allow desktop notifications. Alerts will stay inside Spotify.",
+                true,
+                9000
+              );
               return;
             }
             alerts.os = true;
