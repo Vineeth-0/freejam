@@ -10,7 +10,7 @@ FreeJam has three parts:
 | --- | --- | --- |
 | **Request mode** | No | A normal collaborative playlist acts as a request inbox. New songs guests add are queued on the host's device. |
 | **Sync mode** | Yes | Host-authoritative playback sync over a small relay. Skips, seeks and play/pause from any participant are applied for everyone. |
-| **Friends** | Yes | A private alert when someone you added starts a jam. Only added friends can reach your mailbox; nothing is broadcast to everyone. |
+| **Friends** | Yes | A private native desktop alert (plus a short ding) when someone you added starts a jam. Only added friends can reach your mailbox; nothing is broadcast to everyone. |
 
 Both playback modes work on free accounts. FreeJam is a cooperative third-party
 player, not Spotify Jam.
@@ -46,9 +46,11 @@ player, not Spotify Jam.
 | --- | --- |
 | `freejam.js` | The Spicetify extension. Loads in every Spotify client. |
 | `freejam-relay.js` | The dependency-free Node.js relay used by sync mode and friend mailboxes. |
+| `notifier/` | Optional background notifier for native alerts while Spotify is fully closed. |
 | `scripts/sync-to-spicetify.ps1` | Copies the extension into Spicetify and applies it. |
 | `scripts/deploy-relay.ps1` | Copies the relay to a remote host and restarts its service. |
 | `scripts/install-git-hooks.ps1` | Installs the `post-merge` and `pre-push` hooks. |
+| `scripts/build-bundles.ps1` | Rebuilds the release zip files into `dist/`. |
 | `hooks/post-merge` | After `git pull`, updates the extension and optionally deploys the relay. |
 | `hooks/pre-push` | Before `git push`, updates the extension if it changed. |
 | `README.md` | This file: usage plus the full relay guide. |
@@ -376,10 +378,23 @@ Flow:
 2. The owner sends `hello` with their `sendKey`. The relay registers it.
 3. A friend sends `dm` with `to=<userId>`, `sendKey=<owner's sendKey>`, and a
    jam object.
-4. The relay checks the send key. If it matches, it delivers the jam to every
-   connected device of that owner, or queues it if the owner is offline.
+4. The relay checks the send key. If it matches, it delivers the jam to the
+   owner's connected devices, or queues it if the owner is offline.
 5. The owner's extension checks the sender against its **local friend list**.
    A jam from someone not on the list is ignored even if the relay accepted it.
+
+Mailbox clients identify themselves with `client=app` (the Spotify extension)
+or `client=notifier` (the optional background helper). This keeps alerts from
+doubling up:
+
+- If an app client is connected, the relay sends the jam only to app clients.
+  The extension raises the OS notification; the notifier stays silent.
+- If only notifier clients are connected, the relay sends the jam to those whose
+  declared friend list contains the sender and also queues a copy for the app.
+  The app later receives that copy with `suppressNotify: true`, so it shows the
+  **Join jam** card without a second notification.
+- Pending jams delivered to a notifier are marked `notifiedAt` and kept for the
+  app. Pending jams delivered to the app are removed.
 
 The relay never broadcasts a jam to all users. There is no global feed. A
 mailbox only receives messages addressed to its own user id.
@@ -438,17 +453,23 @@ wss://relay.example.com/?session=<sessionId>&key=<sessionKey>&id=<connectionId>&
 ### 5.3 Mailbox connection URL
 
 ```
-wss://relay.example.com/?user=<userId>&key=<recvKey>&id=<connectionId>&name=<displayName>
+wss://relay.example.com/?user=<userId>&key=<recvKey>&id=<connectionId>&name=<displayName>&client=app
+wss://relay.example.com/?user=<userId>&key=<recvKey>&id=<connectionId>&name=<displayName>&client=notifier
 ```
 
 Presence of the `user` parameter selects mailbox mode. The `key` must be the
-owner's private receive key.
+owner's private receive key. `client` is optional and defaults to `app`;
+`notifier` is used by the background helper so the relay can avoid duplicate
+alerts.
 
 ### 5.4 Mailbox messages
 
 ```jsonc
 // owner → relay
 { "t": "hello", "name": "Alice", "sendKey": "<sendKey>" }
+
+// background notifier → relay (optional local filter)
+{ "t": "hello", "name": "Alice", "friends": ["<friendUserId>", "..."] }
 
 // relay → owner
 { "t": "hello-ok", "userId": "<userId>", "sendKey": "<sendKey>" }
@@ -474,6 +495,9 @@ owner's private receive key.
 
 // relay → mailbox owner
 { "t": "jam", "mode": "sync", "from": "<senderUserId>", "fromName": "Alice", "...": "..." }
+
+// relay → app, for a pending jam the notifier already announced
+{ "t": "jam", "...": "...", "suppressNotify": true }
 
 // friend → relay, then relay → owner
 { "t": "jam-clear", "to": "<friendUserId>", "sendKey": "<friendSendKey>" }
@@ -956,6 +980,9 @@ Important consequences:
   message. If a send key leaks, clear the `freejam:friends:v1` value in
   Spicetify LocalStorage so a new identity is generated, then re-share the new
   friend code.
+- **The background notifier stores your `recvKey`.** The setup code and the
+  local notifier config are equivalent to a mailbox password. Install the
+  notifier only on a device you control, and do not commit or share the config.
 - **The relay can read message contents.** TLS protects the path, but the relay
   (or the proxy that terminates TLS for it) sees plaintext. There is no
   end-to-end encryption. Do not send secrets through jam payloads.
@@ -1047,8 +1074,8 @@ For a permanent hostname, switch to a named Cloudflare Tunnel; see
 
 ## Friends and jam alerts
 
-The Friends card lets you get a Spotify notification when someone you added
-starts a jam, and join it in one click.
+The Friends card lets you get a native Windows or macOS notification — plus a
+short ding — when someone you added starts a jam, and join it in one click.
 
 ### One-time setup
 
@@ -1071,6 +1098,49 @@ Repeat step 5 for each friend. When they add your code too, the card shows
   playlist invite link.
 - If the friend is offline, the invite is delivered the next time they open
   Spotify (for up to 12 hours, unless the relay restarted).
+
+### Desktop alerts and the ding
+
+The Friends card has two alert switches:
+
+- **Desktop notifications** — a native Windows/macOS notification. Clicking it
+  brings Spotify forward. If Spotify or the OS has blocked notification
+  permission, FreeJam falls back to the in-app toast.
+- **Ding sound** — a short synthesized bell. It is generated with the Web Audio
+  API, so there is no audio file to download.
+
+Click **Test alert** to request permission and check both. On Windows, check
+**Settings → System → Notifications** if nothing appears; on macOS, allow
+notifications for Spotify in **System Settings → Notifications**.
+
+Alerts work while Spotify is running, including minimized. They stop when
+Spotify is fully quit, because the extension runs inside Spotify.
+
+### Alerts while Spotify is closed
+
+For that case there is an optional background notifier in `notifier/`. It is a
+small Node.js 18+ helper that connects to the same private mailbox and shows a
+native notification (and the same ding) when Spotify is not running.
+
+1. In the Friends card, click **Copy notifier setup code**.
+2. Download or clone this repository and open `notifier/`.
+3. Run the installer for your OS and paste the code:
+   - Windows: `powershell -ExecutionPolicy Bypass -File .\install-notifier.ps1`
+   - macOS: `bash install-notifier-macos.sh`
+4. The installer starts it now and registers it to start at login.
+
+The setup code contains your **private `recvKey`**, not your send key. Treat it
+like a password and only install it on your own device. Re-copy the code after
+adding or removing friends so the notifier's local filter matches your list, and
+after changing the **Ding sound** setting so the background notifier matches.
+
+The relay avoids duplicate alerts: while the Spotify app is connected, the
+notifier stays silent and the extension raises the alert. If only the notifier
+is connected, it alerts and the relay keeps the jam queued so the app still
+shows a **Join jam** card when it opens.
+
+See [`notifier/README.md`](notifier/README.md) for install details,
+troubleshooting, and uninstall steps.
 
 ### Sending the invite
 
@@ -1101,6 +1171,12 @@ stores a mailbox per user id and forwards a jam only to that mailbox; it never
 broadcasts an invite to every FreeJam user. The extension also checks the
 sender against your local friend list, so a jam from someone you did not add is
 ignored even if it reaches the relay.
+
+The optional background notifier stores the `recvKey` in a local config file so
+it can keep listening while Spotify is closed. That file is created with
+user-only permissions on macOS and Linux and lives in your user profile on
+Windows. The notifier also embeds the friend list from the setup code and
+ignores alerts from any other user id.
 
 Everyone must use the **same relay** for friend mailboxes to work. If you change
 the relay URL, copy your friend code again so friends can update it.
@@ -1150,7 +1226,9 @@ It contains the send key, never the receive key.
   position every 500 ms. Very small seeks may be corrected by the host's next
   state broadcast; use the FreeJam slider for precise seeks.
 - Free accounts hear ads locally. Everyone re-converges after the ad.
-- Friend alerts need FreeJam on both devices and the same relay.
+- Friend alerts need FreeJam on both devices and the same relay. Native alerts
+  work while Spotify is running; install the optional background notifier to
+  receive them while Spotify is fully closed.
 - The relay stores mailboxes and pending alerts in memory, so a relay restart
   drops them.
 - Spotify has no public direct-message API. FreeJam copies an invite message
@@ -1175,6 +1253,10 @@ It contains the send key, never the receive key.
 | No jam alert from a friend | Add each other's `FJF1` codes, then start or resend the jam with **Send to friends**. |
 | "Different relay" warning | You and that friend created codes on different relays. Use the same relay and re-share the friend code. |
 | Friend alert does not arrive while offline | It is queued for up to 12 hours and delivered the next time they open Spotify with FreeJam. |
+| No desktop notification while Spotify is minimized | Click **Test alert** and allow notifications for Spotify in Windows/macOS settings. If Spotify blocks the web notification API, the alert stays in-app. |
+| No alert while Spotify is fully closed | Install the optional background notifier from `notifier/` and paste the setup code from **Friends → Alerts while Spotify is closed**. |
+| Background notifier ignores a new friend | Re-copy the notifier setup code after adding or removing friends, then run the installer again. |
+| Duplicate friend alerts | Update `freejam-relay.js` on the relay. The current relay suppresses the background notifier while the Spotify app is connected. |
 | Relay field pre-filled with someone else's URL | You joined their sync session; the `FJ1` code carries their relay. Keep it for friend alerts, or switch and re-share codes. |
 | Relay URL changed | Quick tunnel restarted. Get the new URL, start a fresh session, update the Friends relay, re-share codes. |
 
@@ -1187,6 +1269,7 @@ Both files are plain JavaScript and can be syntax-checked with:
 ```bash
 node --check freejam.js
 node --check freejam-relay.js
+node --check notifier/freejam-notifier.js
 ```
 
 The relay has no dependencies. The extension expects the Spicetify global

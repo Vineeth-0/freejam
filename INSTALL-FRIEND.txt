@@ -4,12 +4,14 @@ FreeJam - friend install guide
 You already have Spicetify installed. You only need to add the FreeJam
 extension and join the session.
 
-You do NOT need Node.js, the relay, or any of the host's server files.
+You do NOT need Node.js, the relay, or any of the host's server files for the
+basic extension. The optional background notifier in step 8 does need Node.js.
 
 What's in this zip
 ------------------
 freejam.js          the Spicetify extension
 INSTALL-FRIEND.txt  this file
+notifier/           optional background alerts (Node.js 18+)
 
 1. Unzip this file
 ------------------
@@ -110,11 +112,31 @@ having to ask for a code every time.
 4. Click "Copy my code" and send that FJF1... code to the host.
 5. Paste the host's FJF1... code into "Add a friend" and click "Add friend".
 
-After that, when the host starts a sync or request session, you get a
-Spotify notification and a "Join jam" button in your Friends card.
+After that, when the host starts a sync or request session, you get a native
+Windows/macOS notification, a short ding, and a "Join jam" button in your
+Friends card. Click "Test alert" once to allow notifications for Spotify.
 
 Only people you both add can send each other alerts. FreeJam does not
 notify everyone who installed the extension.
+
+8. Alerts while Spotify is closed (optional)
+--------------------------------------------
+The desktop notification above works while Spotify is running, including when
+it is minimized. If you want alerts when Spotify is fully quit, install the
+optional background notifier:
+
+1. Install Node.js 18 or newer from https://nodejs.org/.
+2. Open the "notifier" folder from the FreeJam download.
+3. In the FreeJam panel, open Friends and click "Copy notifier setup code".
+4. Windows: run
+     powershell -ExecutionPolicy Bypass -File .\install-notifier.ps1
+   macOS: run
+     bash install-notifier-macos.sh
+5. Paste the FJN1... code when asked.
+
+The notifier starts at login. Re-copy the setup code after adding or removing
+friends. The code contains your private receive key, so do not share it.
+See notifier/README.md for details and uninstall steps.
 
 Spotify has no public direct-message API, so FreeJam cannot post into
 Spotify's in-app messages. Use "Copy invite message" to copy a ready-to-paste
@@ -151,8 +173,11 @@ Friend stays offline:
 No jam alert:
 - Add each other's FJF1... codes.
 - Ask the host to click "Send to friends" on the active session.
+- Click "Test alert" and allow notifications for Spotify in your OS settings.
 - If you were offline, the alert is delivered the next time you open
   Spotify (for up to 12 hours).
+- If Spotify is fully closed, install the optional background notifier (see
+  step 8). Re-copy its setup code after changing your friend list.
 
 Spotify updated recently:
 - Run "spicetify apply" again, then fully restart Spotify.
@@ -164,5 +189,7 @@ Notes
 - The FJ1... code works like a room password. Do not post it publicly.
 - Your FJF1... friend code contains a send key, not your private receive key.
   A friend can send you a jam but cannot read your mailbox or impersonate you.
+- The optional background notifier uses your private receive key and stores it
+  locally. Only install it on your own device.
 - Request mode (adding songs to a shared playlist) does not require this
   extension at all.

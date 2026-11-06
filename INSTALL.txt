@@ -76,11 +76,24 @@ not notify everyone who installed the extension.
 4. Send that FJF1... code to a friend.
 5. Paste their FJF1... code into "Add a friend" and click "Add friend".
 6. When you start a sync or request session, FreeJam alerts only your added
-   friends. They can click "Join jam" in their panel.
+   friends. They get a native Windows/macOS notification and a short ding, and
+   can click "Join jam" in their panel.
+7. Click "Test alert" once to allow desktop notifications for Spotify.
 
 Your friend code contains a send key, not your private receive key, so a
 friend can send you a jam but cannot read your mailbox or impersonate you.
 Everyone must use the same relay for friend mailboxes.
+
+Alerts work while Spotify is running, including minimized. For alerts when
+Spotify is fully closed, install the optional background notifier (Node.js 18+)
+from the notifier folder:
+
+  Windows: powershell -ExecutionPolicy Bypass -File .\install-notifier.ps1
+  macOS:   bash install-notifier-macos.sh
+
+Copy the setup code from Friends -> "Alerts while Spotify is closed" and paste
+it into the installer. The code contains your private receive key, so do not
+share it. Re-copy the code after adding or removing friends.
 
 Spotify has no public direct-message API. Use "Copy invite message" to copy a
 ready-to-paste message with the jam link and your friend code, then paste it
@@ -95,6 +108,8 @@ Notes
   authentication. Only share it with people you trust.
 - Friend alerts require the current freejam-relay.js. Update the relay when
   the extension is updated.
+- The optional background notifier stores your private receive key locally.
+  Only install it on your own device.
 
 See README.md for the full guide and DEPLOY.md for public relay
 setup (Render, Cloudflare Tunnel, VPS).

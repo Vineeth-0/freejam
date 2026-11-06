@@ -1,0 +1,7 @@
+# Keep shell scripts and git hooks runnable on macOS and Linux even when the
+# repository is checked out on Windows.
+*.sh text eol=lf
+hooks/* text eol=lf
+
+# Everything else uses the platform default.
+* text=auto

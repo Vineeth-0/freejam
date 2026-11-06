@@ -46,7 +46,9 @@
   const SYNC_CMD_GRACE_MS = 1200;
 
   const FRIENDS_STORAGE_KEY = "freejam:friends:v1";
+  const ALERTS_STORAGE_KEY = "freejam:alerts:v1";
   const FRIEND_CODE_PREFIX = "FJF1.";
+  const NOTIFIER_CODE_PREFIX = "FJN1.";
   const FRIEND_PING_INTERVAL_MS = 15000;
   const FRIEND_RECONNECT_MAX_MS = 15000;
   const FRIEND_JAM_NOTIFY_COOLDOWN_MS = 45 * 1000;
@@ -85,6 +87,14 @@
   let endArmedUntil = 0;
   let syncLeaveArmedUntil = 0;
   let lastErrorNotifyAt = 0;
+  let audioContext = null;
+
+  const alerts = {
+    os: true,
+    sound: true,
+  };
+
+  const activeNotifications = new Set();
 
   const ui = {
     button: null,
@@ -411,6 +421,19 @@
     }
   }
 
+  function encodeNotifierCode(identity) {
+    const payload = JSON.stringify({
+      v: 1,
+      u: identity.relayUrl,
+      id: identity.userId,
+      rk: identity.recvKey,
+      n: identity.name || "A friend",
+      f: friends.list.map((friend) => friend.userId),
+      snd: alerts.sound ? 1 : 0,
+    });
+    return `${NOTIFIER_CODE_PREFIX}${base64UrlEncode(payload)}`;
+  }
+
   // ---------------------------------------------------------------------------
   // Persistence
   // ---------------------------------------------------------------------------
@@ -548,6 +571,214 @@
     } catch (err) {
       console.warn("[FreeJam] Could not save friends", err);
     }
+  }
+
+  function loadAlerts() {
+    try {
+      const raw = Spicetify.LocalStorage.get(ALERTS_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!parsed || parsed.version !== 1) return;
+      alerts.os = parsed.os !== false;
+      alerts.sound = parsed.sound !== false;
+    } catch (err) {
+      console.warn("[FreeJam] Could not load alert settings", err);
+    }
+  }
+
+  function saveAlerts() {
+    try {
+      Spicetify.LocalStorage.set(
+        ALERTS_STORAGE_KEY,
+        JSON.stringify({
+          version: 1,
+          os: alerts.os,
+          sound: alerts.sound,
+        })
+      );
+    } catch (err) {
+      console.warn("[FreeJam] Could not save alert settings", err);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Desktop alerts and the notification ding
+  // ---------------------------------------------------------------------------
+
+  function systemNotificationsSupported() {
+    return (
+      typeof window !== "undefined" &&
+      typeof window.Notification === "function"
+    );
+  }
+
+  function notificationPermission() {
+    if (!systemNotificationsSupported()) return "unsupported";
+    try {
+      return window.Notification.permission || "default";
+    } catch {
+      return "denied";
+    }
+  }
+
+  function ensureNotificationPermission(request = false) {
+    if (!systemNotificationsSupported()) return Promise.resolve(false);
+    if (notificationPermission() === "granted") return Promise.resolve(true);
+    if (notificationPermission() === "denied" || !request) {
+      return Promise.resolve(false);
+    }
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value === "granted");
+      };
+      const timer = setTimeout(() => done("denied"), 15000);
+
+      try {
+        const maybe = window.Notification.requestPermission(done);
+        if (maybe && typeof maybe.then === "function") {
+          maybe.then(done, () => done("denied"));
+        }
+      } catch {
+        done("denied");
+      }
+    });
+  }
+
+  function getAudioContext() {
+    if (audioContext) return audioContext;
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) return null;
+    try {
+      audioContext = new Ctor();
+    } catch (err) {
+      console.warn("[FreeJam] Could not create the audio context", err);
+      return null;
+    }
+    return audioContext;
+  }
+
+  function primeAudio() {
+    const ctx = getAudioContext();
+    if (ctx && ctx.state === "suspended") {
+      ctx.resume().catch(() => {});
+    }
+  }
+
+  function playDing() {
+    if (!alerts.sound) return;
+    const ctx = getAudioContext();
+    if (!ctx || ctx.state === "closed") return;
+
+    const start = () => {
+      if (ctx.state === "closed") return;
+      const now = ctx.currentTime + 0.02;
+      const master = ctx.createGain();
+      master.gain.setValueAtTime(0.72, now);
+      master.connect(ctx.destination);
+
+      // A soft two-note bell: low warmth, a bright C6, then a G6 sparkle.
+      const notes = [
+        { freq: 523.25, at: 0, dur: 0.42, gain: 0.12 },
+        { freq: 1046.5, at: 0, dur: 0.55, gain: 0.34 },
+        { freq: 1567.98, at: 0.085, dur: 0.66, gain: 0.26 },
+        { freq: 2093.0, at: 0.085, dur: 0.38, gain: 0.07 },
+      ];
+
+      for (const note of notes) {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        const at = now + note.at;
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(note.freq, at);
+        gain.gain.setValueAtTime(0.0001, at);
+        gain.gain.exponentialRampToValueAtTime(note.gain, at + 0.012);
+        gain.gain.exponentialRampToValueAtTime(0.0001, at + note.dur);
+        osc.connect(gain);
+        gain.connect(master);
+        osc.start(at);
+        osc.stop(at + note.dur + 0.05);
+      }
+    };
+
+    if (ctx.state === "suspended") {
+      ctx.resume().then(start).catch(() => {});
+    } else {
+      start();
+    }
+  }
+
+  function showSystemNotification(title, body, options = {}) {
+    if (!alerts.os || !systemNotificationsSupported()) return false;
+    if (notificationPermission() !== "granted") return false;
+
+    try {
+      const notification = new window.Notification(title, {
+        body,
+        tag: options.tag || "freejam",
+        silent: true,
+      });
+      activeNotifications.add(notification);
+
+      const cleanup = () => activeNotifications.delete(notification);
+      notification.onclose = cleanup;
+      notification.onerror = cleanup;
+      notification.onclick = () => {
+        try {
+          window.focus();
+        } catch {
+          /* ignore */
+        }
+        try {
+          notification.close();
+        } catch {
+          /* ignore */
+        }
+      };
+
+      setTimeout(() => {
+        try {
+          notification.close();
+        } catch {
+          /* ignore */
+        }
+      }, 15000);
+      return true;
+    } catch (err) {
+      console.warn("[FreeJam] Desktop notification failed", err);
+      return false;
+    }
+  }
+
+  function showAlert(title, body, options = {}) {
+    const shown = showSystemNotification(title, body, options);
+    if (!shown) {
+      const text = title === "FreeJam" ? body : `${title} — ${body}`;
+      Spicetify.showNotification(
+        text,
+        Boolean(options.error),
+        options.duration || 8000
+      );
+    }
+    if (alerts.sound && options.sound !== false) playDing();
+    return shown;
+  }
+
+  function showJamAlert(jam) {
+    const what =
+      jam.mode === "sync" ? "a playback sync" : "a listening session";
+    return showAlert(
+      `${jam.fromName || "A friend"} started ${what}`,
+      "Open FreeJam to join.",
+      {
+        tag: `freejam-jam-${jam.from || "friend"}`,
+        duration: 8000,
+      }
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -1832,6 +2063,7 @@
       url.searchParams.set("key", friends.identity.recvKey);
       url.searchParams.set("id", friends.selfId);
       url.searchParams.set("name", friendIdentityName());
+      url.searchParams.set("client", "app");
     } catch {
       friends.error = "Invalid relay URL.";
       refreshFriendsPanel();
@@ -2067,15 +2299,12 @@
       return;
     }
 
-    if (Date.now() - friends.lastNotifyAt >= FRIEND_JAM_NOTIFY_COOLDOWN_MS) {
+    if (
+      !jam.suppressNotify &&
+      Date.now() - friends.lastNotifyAt >= FRIEND_JAM_NOTIFY_COOLDOWN_MS
+    ) {
       friends.lastNotifyAt = Date.now();
-      const what =
-        jam.mode === "sync" ? "a playback sync" : "a listening session";
-      Spicetify.showNotification(
-        `${jam.fromName || "A friend"} started ${what}. Open FreeJam to join.`,
-        false,
-        8000
-      );
+      showJamAlert(jam);
     }
 
     updateButton();
@@ -2392,6 +2621,22 @@
       .fj-muted {
         color: var(--spice-subtext, #b3b3b3);
         font-size: 12px;
+      }
+      .fj-check {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        color: var(--spice-subtext, #b3b3b3);
+        font-size: 12px;
+        cursor: pointer;
+        user-select: none;
+      }
+      .fj-check input {
+        margin: 0;
+        accent-color: var(--spice-button, #1db954);
+      }
+      .fj-alert-row {
+        flex-wrap: wrap;
       }
       .fj-warn {
         color: #f6c358;
@@ -2800,6 +3045,43 @@
     relayRow.append(relayInput, saveRelay);
     wrap.append(relayRow);
 
+    const alertRow = el("div", "fj-row fj-alert-row");
+    const osLabel = el("label", "fj-check");
+    const osInput = document.createElement("input");
+    osInput.type = "checkbox";
+    osInput.checked = alerts.os;
+    osInput.disabled = !systemNotificationsSupported();
+    osInput.dataset.action = "friendsToggleOs";
+    osLabel.append(osInput, el("span", null, "Desktop notifications"));
+
+    const soundLabel = el("label", "fj-check");
+    const soundInput = document.createElement("input");
+    soundInput.type = "checkbox";
+    soundInput.checked = alerts.sound;
+    soundInput.dataset.action = "friendsToggleSound";
+    soundLabel.append(soundInput, el("span", null, "Ding sound"));
+
+    alertRow.append(osLabel, soundLabel);
+    wrap.append(alertRow);
+
+    const permission = notificationPermission();
+    let alertHint;
+    let alertHintClass = "fj-hint";
+    if (permission === "unsupported") {
+      alertHint =
+        "This Spotify build does not expose desktop notifications, so alerts stay in-app.";
+    } else if (permission === "denied") {
+      alertHint =
+        "Desktop notifications are blocked by Spotify or your OS. Allow notifications for Spotify in system settings, or keep alerts in-app.";
+      alertHintClass = "fj-warn";
+    } else if (permission === "default") {
+      alertHint = "Click Test alert to allow desktop notifications.";
+    } else {
+      alertHint =
+        "Desktop notifications are on. They also appear when Spotify is minimized.";
+    }
+    wrap.append(el("div", alertHintClass, alertHint));
+
     const jam = friends.incomingJam;
     if (jam) {
       const box = el("div", "fj-status fj-jam");
@@ -2841,12 +3123,28 @@
     actions.append(
       actionButton("friendsCopyMessage", "Copy invite message", "secondary")
     );
+    actions.append(actionButton("friendsTestAlert", "Test alert", "secondary"));
     if (!friends.connected && friends.identity.relayUrl) {
       actions.append(
         actionButton("friendsReconnect", "Reconnect", "secondary")
       );
     }
     wrap.append(actions);
+
+    wrap.append(el("div", "fj-divider"));
+    wrap.append(el("div", "fj-subtitle", "Alerts while Spotify is closed"));
+    wrap.append(
+      el(
+        "div",
+        "fj-hint",
+        "Native alerts work whenever Spotify is running, even minimized. For alerts when Spotify is fully closed, install the optional background notifier (Node.js 18+). It uses your private receive key, so only install it on your own device. Re-copy the setup code after adding or removing friends, or changing the ding setting."
+      )
+    );
+    const backgroundActions = el("div", "fj-actions");
+    backgroundActions.append(
+      actionButton("friendsCopyNotifier", "Copy notifier setup code", "secondary")
+    );
+    wrap.append(backgroundActions);
 
     wrap.append(el("div", "fj-divider"));
     wrap.append(el("div", "fj-subtitle", "Add a friend"));
@@ -3276,6 +3574,74 @@
           );
           break;
         }
+        case "friendsToggleOs": {
+          const input = button.matches("input")
+            ? button
+            : button.querySelector("input");
+          if (!input) return;
+
+          if (input.checked) {
+            const granted = await ensureNotificationPermission(true);
+            if (!granted) {
+              input.checked = false;
+              Spicetify.showNotification(
+                "Spotify did not grant desktop notification permission. Allow notifications for Spotify in your OS settings, or keep alerts in-app.",
+                true,
+                9000
+              );
+              return;
+            }
+          }
+
+          alerts.os = input.checked;
+          saveAlerts();
+          refreshFriendsPanel();
+          break;
+        }
+        case "friendsToggleSound": {
+          const input = button.matches("input")
+            ? button
+            : button.querySelector("input");
+          if (!input) return;
+
+          alerts.sound = input.checked;
+          saveAlerts();
+          if (alerts.sound) playDing();
+          break;
+        }
+        case "friendsTestAlert": {
+          if (alerts.os) {
+            const granted = await ensureNotificationPermission(true);
+            if (!granted) {
+              Spicetify.showNotification(
+                "Desktop notifications are blocked. Enable them for Spotify in your OS settings; the test will stay in-app.",
+                true,
+                9000
+              );
+            }
+            // Refresh so the permission hint reflects the new state.
+            refreshFriendsPanel();
+          }
+          showAlert(
+            "FreeJam",
+            "Desktop alerts are working. You will hear this ding when a friend starts a jam.",
+            { tag: "freejam-test" }
+          );
+          break;
+        }
+        case "friendsCopyNotifier": {
+          if (!friends.identity) return;
+          const code = encodeNotifierCode(friends.identity);
+          const ok = await copyText(code);
+          Spicetify.showNotification(
+            ok
+              ? "Notifier setup code copied. Paste it into the FreeJam notifier installer. Re-copy after adding or removing friends."
+              : "Could not copy the notifier setup code.",
+            !ok,
+            8000
+          );
+          break;
+        }
         case "friendsInviteOne": {
           const friend = friends.list.find(
             (item) => item.userId === button.dataset.friendId
@@ -3652,9 +4018,17 @@
 
     loadState();
     loadFriends();
+    loadAlerts();
     injectStyles();
     createPlaybarButton();
     registerContextMenu();
+
+    // Browsers only allow audio after a user gesture. Prime the audio context
+    // on the first click so the friend-alert ding can play later.
+    document.addEventListener("pointerdown", primeAudio, {
+      once: true,
+      capture: true,
+    });
 
     try {
       Spicetify.Player.addEventListener("songchange", () => {

@@ -243,6 +243,8 @@ like before.
   deletes the pending alert.
 - A friend code contains a mailbox send key, not the owner's private receive
   key. The relay never broadcasts a jam to all users.
+- The optional background notifier runs on each friend's own computer, not on
+  the Pi. It stores that user's private receive key locally.
 - Bind it to `127.0.0.1` when Cloudflare Tunnel is the only way in.
 - The `FJ1...` key is a room password, not strong authentication. Only share it
   with people you trust.

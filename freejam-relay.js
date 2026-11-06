@@ -57,7 +57,7 @@ const mailboxes = new Map();
  * A jam sent to a friend who is offline. It is delivered when they connect and
  * prove they own the mailbox.
  *
- * @type {Map<string, {sk: string, jam: object, from: string, fromName: string, at: number}>}
+ * @type {Map<string, Array<{sk: string, jam: object, at: number, notifiedAt: number}>>}
  */
 const pendingJams = new Map();
 
@@ -71,7 +71,9 @@ class Client {
     this.name = name;
     this.role = role;
     this.kind = "session";
+    this.clientKind = "app";
     this.userId = "";
+    this.friends = null;
     this.watching = new Set();
     this.buffer = Buffer.alloc(0);
     this.fragments = [];
@@ -261,6 +263,7 @@ function queuePending(userId, entry) {
     pendingJams.set(userId, list);
   }
 
+  entry.notifiedAt = Number(entry.notifiedAt) || 0;
   list.push(entry);
 
   const cutoff = Date.now() - MAX_JAM_AGE_MS;
@@ -276,6 +279,8 @@ function deliverPending(client) {
 
   const now = Date.now();
   const box = client.room;
+  const isNotifier = client.clientKind === "notifier";
+  let deliveredToApp = false;
 
   for (const entry of list) {
     if (entry.at + MAX_JAM_AGE_MS <= now) continue;
@@ -289,10 +294,28 @@ function deliverPending(client) {
     ) {
       continue;
     }
-    client.send(entry.jam);
+
+    if (isNotifier) {
+      // A notifier may announce a pending jam while Spotify is closed, but it
+      // must not consume the invite. The app still needs it when it opens.
+      if (client.friends && !client.friends.has(entry.jam.from)) continue;
+      if (entry.notifiedAt) continue;
+      entry.notifiedAt = now;
+      client.send(entry.jam);
+      continue;
+    }
+
+    const jam = Object.assign({}, entry.jam);
+    if (entry.notifiedAt && now - entry.notifiedAt < MAX_JAM_AGE_MS) {
+      // The background notifier already announced this one. The app still gets
+      // the Join jam card, but should not fire a second notification.
+      jam.suppressNotify = true;
+    }
+    client.send(jam);
+    deliveredToApp = true;
   }
 
-  pendingJams.delete(client.userId);
+  if (deliveredToApp) pendingJams.delete(client.userId);
 }
 
 function handleMailboxMessage(client, message) {
@@ -305,6 +328,15 @@ function handleMailboxMessage(client, message) {
     // created before the owner first connected.
     const sendKey = safeString(message.sendKey, 256);
     if (sendKey) client.room.sendKey = sendKey;
+
+    if (Array.isArray(message.friends)) {
+      client.friends = new Set(
+        message.friends
+          .map((id) => safeString(id, 128))
+          .filter(Boolean)
+          .slice(0, MAX_WATCHED_USERS)
+      );
+    }
 
     client.send({
       t: "hello-ok",
@@ -346,10 +378,34 @@ function handleMailboxMessage(client, message) {
     if (!jam) return;
     target.lastJam = jam;
 
-    if (target.clients.size > 0) {
-      for (const other of target.clients) other.send(jam);
+    const appClients = [];
+    const notifierClients = [];
+    for (const other of target.clients) {
+      if (other.clientKind === "notifier") notifierClients.push(other);
+      else appClients.push(other);
+    }
+
+    if (appClients.length > 0) {
+      // Spotify is open, so the extension itself will raise the OS alert.
+      // Keep the background notifier silent to avoid a duplicate.
+      for (const other of appClients) other.send(jam);
     } else {
-      queuePending(to, { sk: sendKey, jam, at: Date.now() });
+      // Only announce through notifiers whose cached friend list contains the
+      // sender. A stale notifier must not suppress the app's later alert.
+      const eligibleNotifiers = notifierClients.filter(
+        (other) => !other.friends || other.friends.has(client.userId)
+      );
+      for (const other of eligibleNotifiers) other.send(jam);
+
+      // If only the notifier is connected, queue a copy so the app still has a
+      // Join jam card the next time it opens. notifiedAt suppresses a second
+      // notification from the app in that case.
+      queuePending(to, {
+        sk: sendKey,
+        jam,
+        at: Date.now(),
+        notifiedAt: eligibleNotifiers.length > 0 ? Date.now() : 0,
+      });
     }
     return;
   }
@@ -500,6 +556,8 @@ server.on("upgrade", (req, socket) => {
   const id = safeString(url.searchParams.get("id"), 64) || crypto.randomBytes(8).toString("hex");
   const name = safeString(url.searchParams.get("name"), 64) || "Listener";
   const isMailbox = Boolean(userId);
+  const clientKind =
+    url.searchParams.get("client") === "notifier" ? "notifier" : "app";
 
   if ((!isMailbox && !session) || !roomKey) {
     socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
@@ -571,11 +629,12 @@ server.on("upgrade", (req, socket) => {
     collectionKey = userId;
     client = new Client(socket, box, sessionLabel, roomKey, id, name, role);
     client.kind = "mailbox";
+    client.clientKind = clientKind;
     client.userId = userId;
     box.clients.add(client);
 
     console.log(
-      `[mailbox] ${userId.slice(0, 8)}… ${name} (${id}) — ${box.clients.size} connected`
+      `[mailbox] ${userId.slice(0, 8)}… ${name} (${id}) ${clientKind} — ${box.clients.size} connected`
     );
 
     notifyWatchers(userId);
