@@ -17,9 +17,8 @@ jam. It has no npm dependencies.
 ## Get the setup code
 
 1. Open Spotify and the FreeJam panel.
-2. Open **Friends**.
-3. Scroll to **Alerts while Spotify is closed**.
-4. Click **Copy notifier setup code**.
+2. Open **Settings** at the bottom of the panel.
+3. Under **Alerts while Spotify is closed**, click **Copy setup code**.
 
 The code starts with `FJN1.`. It contains your **private receive key**, so treat
 it like a password. Do not paste it into a chat, issue, or public site.

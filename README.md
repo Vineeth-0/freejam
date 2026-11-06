@@ -1101,17 +1101,19 @@ Repeat step 5 for each friend. When they add your code too, the card shows
 
 ### Desktop alerts and the ding
 
-The Friends card has two alert switches:
+Alert preferences live in the **Settings** section at the bottom of the FreeJam
+panel:
 
-- **Desktop notifications** — a native Windows/macOS notification. Clicking it
-  brings Spotify forward. If Spotify or the OS has blocked notification
-  permission, FreeJam falls back to the in-app toast.
+- **Desktop notifications** — a native Windows/macOS notification. Turning it on
+  asks Spotify for permission the first time. Clicking the notification brings
+  Spotify forward. If permission is blocked, FreeJam falls back to the in-app
+  toast.
 - **Ding sound** — a short synthesized bell. It is generated with the Web Audio
   API, so there is no audio file to download.
 
-Click **Test alert** to request permission and check both. On Windows, check
-**Settings → System → Notifications** if nothing appears; on macOS, allow
-notifications for Spotify in **System Settings → Notifications**.
+If notifications do not appear, allow them for Spotify in
+**Settings → System → Notifications** on Windows, or
+**System Settings → Notifications** on macOS.
 
 Alerts work while Spotify is running, including minimized. They stop when
 Spotify is fully quit, because the extension runs inside Spotify.
@@ -1122,12 +1124,13 @@ For that case there is an optional background notifier in `notifier/`. It is a
 small Node.js 18+ helper that connects to the same private mailbox and shows a
 native notification (and the same ding) when Spotify is not running.
 
-1. In the Friends card, click **Copy notifier setup code**.
-2. Download or clone this repository and open `notifier/`.
-3. Run the installer for your OS and paste the code:
+1. Open **Settings** in the FreeJam panel.
+2. Under **Alerts while Spotify is closed**, click **Copy setup code**.
+3. Download or clone this repository and open `notifier/`.
+4. Run the installer for your OS and paste the code:
    - Windows: `powershell -ExecutionPolicy Bypass -File .\install-notifier.ps1`
    - macOS: `bash install-notifier-macos.sh`
-4. The installer starts it now and registers it to start at login.
+5. The installer starts it now and registers it to start at login.
 
 The setup code contains your **private `recvKey`**, not your send key. Treat it
 like a password and only install it on your own device. Re-copy the code after
@@ -1253,9 +1256,9 @@ It contains the send key, never the receive key.
 | No jam alert from a friend | Add each other's `FJF1` codes, then start or resend the jam with **Send to friends**. |
 | "Different relay" warning | You and that friend created codes on different relays. Use the same relay and re-share the friend code. |
 | Friend alert does not arrive while offline | It is queued for up to 12 hours and delivered the next time they open Spotify with FreeJam. |
-| No desktop notification while Spotify is minimized | Click **Test alert** and allow notifications for Spotify in Windows/macOS settings. If Spotify blocks the web notification API, the alert stays in-app. |
-| No alert while Spotify is fully closed | Install the optional background notifier from `notifier/` and paste the setup code from **Friends → Alerts while Spotify is closed**. |
-| Background notifier ignores a new friend | Re-copy the notifier setup code after adding or removing friends, then run the installer again. |
+| No desktop notification while Spotify is minimized | Turn on **Desktop notifications** in Settings and allow notifications for Spotify in Windows/macOS settings. If Spotify blocks the web notification API, the alert stays in-app. |
+| No alert while Spotify is fully closed | Install the optional background notifier from `notifier/` and paste the code from **Settings → Alerts while Spotify is closed**. |
+| Background notifier ignores a new friend | Re-copy the setup code from Settings after adding or removing friends, then run the installer again. |
 | Duplicate friend alerts | Update `freejam-relay.js` on the relay. The current relay suppresses the background notifier while the Spotify app is connected. |
 | Relay field pre-filled with someone else's URL | You joined their sync session; the `FJ1` code carries their relay. Keep it for friend alerts, or switch and re-share codes. |
 | Relay URL changed | Quick tunnel restarted. Get the new URL, start a fresh session, update the Friends relay, re-share codes. |

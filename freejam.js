@@ -2622,21 +2622,62 @@
         color: var(--spice-subtext, #b3b3b3);
         font-size: 12px;
       }
-      .fj-check {
-        display: inline-flex;
+      .fj-setting {
+        display: flex;
         align-items: center;
-        gap: 7px;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 10px 0;
+        border-top: 1px solid rgba(255, 255, 255, 0.06);
+      }
+      .fj-setting:first-of-type {
+        border-top: 0;
+        padding-top: 0;
+      }
+      .fj-setting-text {
+        min-width: 0;
+      }
+      .fj-setting-title {
+        font-weight: 600;
+        font-size: 13px;
+      }
+      .fj-setting-desc {
+        margin-top: 2px;
         color: var(--spice-subtext, #b3b3b3);
         font-size: 12px;
+      }
+      .fj-switch {
+        position: relative;
+        flex: 0 0 auto;
+        width: 42px;
+        height: 24px;
+        padding: 0;
+        border: 0;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.22);
         cursor: pointer;
-        user-select: none;
+        transition: background 0.15s ease;
       }
-      .fj-check input {
-        margin: 0;
-        accent-color: var(--spice-button, #1db954);
+      .fj-switch::after {
+        content: "";
+        position: absolute;
+        top: 3px;
+        left: 3px;
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: #fff;
+        transition: transform 0.15s ease;
       }
-      .fj-alert-row {
-        flex-wrap: wrap;
+      .fj-switch[aria-checked="true"] {
+        background: var(--spice-button, #1db954);
+      }
+      .fj-switch[aria-checked="true"]::after {
+        transform: translateX(18px);
+      }
+      .fj-switch:disabled {
+        opacity: 0.45;
+        cursor: default;
       }
       .fj-warn {
         color: #f6c358;
@@ -2998,6 +3039,153 @@
     return row;
   }
 
+  function settingRow(title, description, control) {
+    const row = el("div", "fj-setting");
+    const text = el("div", "fj-setting-text");
+    text.append(el("div", "fj-setting-title", title));
+    if (description) text.append(el("div", "fj-setting-desc", description));
+    row.append(text, control);
+    return row;
+  }
+
+  function switchButton(action, label, on, disabled) {
+    const button = el("button", "fj-switch");
+    button.type = "button";
+    button.dataset.action = action;
+    button.setAttribute("role", "switch");
+    button.setAttribute("aria-label", label);
+    button.setAttribute("aria-checked", on ? "true" : "false");
+    button.disabled = Boolean(disabled);
+    return button;
+  }
+
+  function buildSettingsCard() {
+    const wrap = el("div", "fj-card");
+
+    const head = el("div", "fj-card-head");
+    head.append(el("div", "fj-card-title", "Notifications"));
+    wrap.append(head);
+
+    const permission = notificationPermission();
+    const osOn = alerts.os && permission === "granted";
+
+    wrap.append(
+      settingRow(
+        "Desktop notifications",
+        "Show a Windows or macOS notification when a friend starts a jam.",
+        switchButton(
+          "settingsToggleOs",
+          "Desktop notifications",
+          osOn,
+          permission === "unsupported"
+        )
+      )
+    );
+
+    wrap.append(
+      settingRow(
+        "Ding sound",
+        "Play a short chime with each alert.",
+        switchButton("settingsToggleSound", "Ding sound", alerts.sound)
+      )
+    );
+
+    let statusText;
+    let statusClass = "fj-hint";
+    if (permission === "unsupported") {
+      statusText =
+        "This Spotify version cannot show desktop notifications. Alerts stay inside Spotify.";
+    } else if (permission === "denied") {
+      statusText =
+        "Notifications are blocked. Allow them for Spotify in your system settings, then turn this on again.";
+      statusClass = "fj-warn";
+    } else if (permission === "granted") {
+      statusText = osOn
+        ? "On. Notifications also appear when Spotify is minimized."
+        : "Desktop notifications are off. Turn them on to get alerts outside Spotify.";
+    } else {
+      statusText =
+        "Turn on desktop notifications to allow Spotify to show them.";
+    }
+    wrap.append(el("div", statusClass, statusText));
+
+    if (friends.identity) {
+      wrap.append(el("div", "fj-divider"));
+      wrap.append(
+        el("div", "fj-subtitle", "Alerts while Spotify is closed")
+      );
+      wrap.append(
+        el(
+          "div",
+          "fj-hint",
+          "Spotify must be running for its own notifications. For alerts when it is fully closed, install the optional background notifier on this device. Re-copy the code after changing your friends or the ding setting."
+        )
+      );
+      const backgroundActions = el("div", "fj-actions");
+      backgroundActions.append(
+        actionButton("settingsCopyNotifier", "Copy setup code", "secondary")
+      );
+      wrap.append(backgroundActions);
+
+      wrap.append(el("div", "fj-divider"));
+      wrap.append(el("div", "fj-subtitle", "Friend relay"));
+      wrap.append(
+        el(
+          "div",
+          "fj-hint",
+          "The server you and your friends use for jam alerts. Everyone needs the same relay."
+        )
+      );
+      const relayRow = el("div", "fj-row");
+      const relayInput = document.createElement("input");
+      relayInput.className = "fj-input";
+      relayInput.placeholder = "wss://your-relay.example.com";
+      relayInput.value = friends.identity.relayUrl || "";
+      relayInput.dataset.fj = "settingsRelayEdit";
+      const saveRelay = el("button", "fj-btn secondary", "Save");
+      saveRelay.dataset.action = "settingsSaveRelay";
+      relayRow.append(relayInput, saveRelay);
+      wrap.append(relayRow);
+    } else {
+      wrap.append(el("div", "fj-divider"));
+      wrap.append(
+        el(
+          "div",
+          "fj-hint",
+          "Create your friend code in Friends to set up background alerts and the relay."
+        )
+      );
+    }
+
+    return wrap;
+  }
+
+  function settingsRenderKey() {
+    return [
+      alerts.os ? "os" : "off",
+      alerts.sound ? "sound" : "mute",
+      notificationPermission(),
+      friends.identity ? friends.identity.relayUrl : "none",
+      friends.list.map((friend) => friend.userId).join(","),
+    ].join("|");
+  }
+
+  function renderSettingsSection(container) {
+    if (!container) return;
+    const key = settingsRenderKey();
+    if (container.dataset.renderKey === key) return;
+    container.dataset.renderKey = key;
+    container.replaceChildren(buildSettingsCard());
+  }
+
+  function refreshSettingsPanel() {
+    if (!ui.root) return;
+    const container = $('[data-fj="settings"]', ui.root);
+    if (!container) return;
+    container.dataset.renderKey = "";
+    renderSettingsSection(container);
+  }
+
   function buildFriendsCard() {
     const wrap = el("div", "fj-card");
 
@@ -3023,7 +3211,7 @@
     let statusText;
     if (!friends.identity.relayUrl) {
       statusDot.classList.add("off");
-      statusText = "Set a relay URL so friends can reach you.";
+      statusText = "Set a relay in Settings so friends can reach you.";
     } else if (!friends.connected) {
       statusDot.classList.add("off");
       statusText = friends.error || "Connecting to the friend relay…";
@@ -3033,54 +3221,6 @@
     }
     status.append(statusDot, el("span", null, statusText));
     wrap.append(status);
-
-    const relayRow = el("div", "fj-row");
-    const relayInput = document.createElement("input");
-    relayInput.className = "fj-input";
-    relayInput.placeholder = "wss://your-relay.example.com";
-    relayInput.value = friends.identity.relayUrl || "";
-    relayInput.dataset.fj = "friendRelayEdit";
-    const saveRelay = el("button", "fj-btn secondary", "Save relay");
-    saveRelay.dataset.action = "friendsSaveRelay";
-    relayRow.append(relayInput, saveRelay);
-    wrap.append(relayRow);
-
-    const alertRow = el("div", "fj-row fj-alert-row");
-    const osLabel = el("label", "fj-check");
-    const osInput = document.createElement("input");
-    osInput.type = "checkbox";
-    osInput.checked = alerts.os;
-    osInput.disabled = !systemNotificationsSupported();
-    osInput.dataset.action = "friendsToggleOs";
-    osLabel.append(osInput, el("span", null, "Desktop notifications"));
-
-    const soundLabel = el("label", "fj-check");
-    const soundInput = document.createElement("input");
-    soundInput.type = "checkbox";
-    soundInput.checked = alerts.sound;
-    soundInput.dataset.action = "friendsToggleSound";
-    soundLabel.append(soundInput, el("span", null, "Ding sound"));
-
-    alertRow.append(osLabel, soundLabel);
-    wrap.append(alertRow);
-
-    const permission = notificationPermission();
-    let alertHint;
-    let alertHintClass = "fj-hint";
-    if (permission === "unsupported") {
-      alertHint =
-        "This Spotify build does not expose desktop notifications, so alerts stay in-app.";
-    } else if (permission === "denied") {
-      alertHint =
-        "Desktop notifications are blocked by Spotify or your OS. Allow notifications for Spotify in system settings, or keep alerts in-app.";
-      alertHintClass = "fj-warn";
-    } else if (permission === "default") {
-      alertHint = "Click Test alert to allow desktop notifications.";
-    } else {
-      alertHint =
-        "Desktop notifications are on. They also appear when Spotify is minimized.";
-    }
-    wrap.append(el("div", alertHintClass, alertHint));
 
     const jam = friends.incomingJam;
     if (jam) {
@@ -3123,28 +3263,12 @@
     actions.append(
       actionButton("friendsCopyMessage", "Copy invite message", "secondary")
     );
-    actions.append(actionButton("friendsTestAlert", "Test alert", "secondary"));
     if (!friends.connected && friends.identity.relayUrl) {
       actions.append(
         actionButton("friendsReconnect", "Reconnect", "secondary")
       );
     }
     wrap.append(actions);
-
-    wrap.append(el("div", "fj-divider"));
-    wrap.append(el("div", "fj-subtitle", "Alerts while Spotify is closed"));
-    wrap.append(
-      el(
-        "div",
-        "fj-hint",
-        "Native alerts work whenever Spotify is running, even minimized. For alerts when Spotify is fully closed, install the optional background notifier (Node.js 18+). It uses your private receive key, so only install it on your own device. Re-copy the setup code after adding or removing friends, or changing the ding setting."
-      )
-    );
-    const backgroundActions = el("div", "fj-actions");
-    backgroundActions.append(
-      actionButton("friendsCopyNotifier", "Copy notifier setup code", "secondary")
-    );
-    wrap.append(backgroundActions);
 
     wrap.append(el("div", "fj-divider"));
     wrap.append(el("div", "fj-subtitle", "Add a friend"));
@@ -3332,6 +3456,7 @@
     const session = $('[data-fj="session"]', root);
     const syncContainer = $('[data-fj="sync"]', root);
     const friendsContainer = $('[data-fj="friends"]', root);
+    const settingsContainer = $('[data-fj="settings"]', root);
     const count = $('[data-fj="count"]', root);
     const now = $('[data-fj="now"]', root);
     const list = $('[data-fj="requests"]', root);
@@ -3385,6 +3510,7 @@
 
     if (syncContainer) renderSyncSection(syncContainer);
     if (friendsContainer) renderFriendsSection(friendsContainer);
+    if (settingsContainer) renderSettingsSection(settingsContainer);
 
     if (now) {
       now.replaceChildren();
@@ -3454,6 +3580,7 @@
         <div class="fj-now" data-fj="now"></div>
         <div class="fj-list" data-fj="requests"></div>
       </div>
+      <details class="fj-section"><summary>Settings</summary><div class="fj-section-body" data-fj="settings"></div></details>
       <div class="fj-hint" data-fj="hint"></div>
     `;
     root.addEventListener("click", onPanelClick);
@@ -3574,69 +3701,47 @@
           );
           break;
         }
-        case "friendsToggleOs": {
-          const input = button.matches("input")
-            ? button
-            : button.querySelector("input");
-          if (!input) return;
-
-          if (input.checked) {
+        case "settingsToggleOs": {
+          const on = button.getAttribute("aria-checked") !== "true";
+          if (on) {
             const granted = await ensureNotificationPermission(true);
             if (!granted) {
-              input.checked = false;
-              Spicetify.showNotification(
-                "Spotify did not grant desktop notification permission. Allow notifications for Spotify in your OS settings, or keep alerts in-app.",
-                true,
-                9000
-              );
+              alerts.os = false;
+              saveAlerts();
+              refreshSettingsPanel();
+              if (notificationPermission() === "denied") {
+                Spicetify.showNotification(
+                  "Allow notifications for Spotify in your system settings, then turn this on again.",
+                  true,
+                  9000
+                );
+              }
               return;
             }
+            alerts.os = true;
+          } else {
+            alerts.os = false;
           }
-
-          alerts.os = input.checked;
           saveAlerts();
-          refreshFriendsPanel();
+          refreshSettingsPanel();
           break;
         }
-        case "friendsToggleSound": {
-          const input = button.matches("input")
-            ? button
-            : button.querySelector("input");
-          if (!input) return;
-
-          alerts.sound = input.checked;
+        case "settingsToggleSound": {
+          const on = button.getAttribute("aria-checked") !== "true";
+          alerts.sound = on;
           saveAlerts();
-          if (alerts.sound) playDing();
+          if (on) playDing();
+          refreshSettingsPanel();
           break;
         }
-        case "friendsTestAlert": {
-          if (alerts.os) {
-            const granted = await ensureNotificationPermission(true);
-            if (!granted) {
-              Spicetify.showNotification(
-                "Desktop notifications are blocked. Enable them for Spotify in your OS settings; the test will stay in-app.",
-                true,
-                9000
-              );
-            }
-            // Refresh so the permission hint reflects the new state.
-            refreshFriendsPanel();
-          }
-          showAlert(
-            "FreeJam",
-            "Desktop alerts are working. You will hear this ding when a friend starts a jam.",
-            { tag: "freejam-test" }
-          );
-          break;
-        }
-        case "friendsCopyNotifier": {
+        case "settingsCopyNotifier": {
           if (!friends.identity) return;
           const code = encodeNotifierCode(friends.identity);
           const ok = await copyText(code);
           Spicetify.showNotification(
             ok
-              ? "Notifier setup code copied. Paste it into the FreeJam notifier installer. Re-copy after adding or removing friends."
-              : "Could not copy the notifier setup code.",
+              ? "Setup code copied. Paste it into the background notifier installer. Re-copy it after changing your friends or the ding setting."
+              : "Could not copy the setup code.",
             !ok,
             8000
           );
@@ -3693,6 +3798,7 @@
           friends.reconnectDelay = 1000;
           connectFriends();
           refreshFriendsPanel();
+          refreshSettingsPanel();
           Spicetify.showNotification(
             "Friend code ready. Copy it and send it to the people you trust."
           );
@@ -3758,6 +3864,7 @@
           saveFriends();
           watchFriends();
           refreshFriendsPanel();
+          refreshSettingsPanel();
 
           if (
             friends.identity &&
@@ -3784,6 +3891,7 @@
           saveFriends();
           watchFriends();
           refreshFriendsPanel();
+          refreshSettingsPanel();
           break;
         }
         case "friendsJoin":
@@ -3798,8 +3906,8 @@
           connectFriends();
           refreshFriendsPanel();
           break;
-        case "friendsSaveRelay": {
-          const input = $('[data-fj="friendRelayEdit"]', ui.root);
+        case "settingsSaveRelay": {
+          const input = $('[data-fj="settingsRelayEdit"]', ui.root);
           const relayUrl = normalizeRelayUrl(input ? input.value : "");
           if (!relayUrl) {
             Spicetify.showNotification("Enter a valid relay URL.", true);
@@ -3814,6 +3922,7 @@
           friends.error = null;
           friends.reconnectDelay = 1000;
           connectFriends();
+          refreshSettingsPanel();
           refreshFriendsPanel();
           Spicetify.showNotification(
             "Friend relay updated. Copy your friend code again so friends can update it."

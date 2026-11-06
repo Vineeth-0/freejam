@@ -114,7 +114,8 @@ having to ask for a code every time.
 
 After that, when the host starts a sync or request session, you get a native
 Windows/macOS notification, a short ding, and a "Join jam" button in your
-Friends card. Click "Test alert" once to allow notifications for Spotify.
+Friends card. Open Settings and turn on "Desktop notifications" to allow them
+for Spotify.
 
 Only people you both add can send each other alerts. FreeJam does not
 notify everyone who installed the extension.
@@ -127,7 +128,8 @@ optional background notifier:
 
 1. Install Node.js 18 or newer from https://nodejs.org/.
 2. Open the "notifier" folder from the FreeJam download.
-3. In the FreeJam panel, open Friends and click "Copy notifier setup code".
+3. In the FreeJam panel, open Settings and click "Copy setup code" under
+   "Alerts while Spotify is closed".
 4. Windows: run
      powershell -ExecutionPolicy Bypass -File .\install-notifier.ps1
    macOS: run
@@ -173,7 +175,8 @@ Friend stays offline:
 No jam alert:
 - Add each other's FJF1... codes.
 - Ask the host to click "Send to friends" on the active session.
-- Click "Test alert" and allow notifications for Spotify in your OS settings.
+- Open Settings and turn on "Desktop notifications", then allow notifications
+  for Spotify in your OS settings.
 - If you were offline, the alert is delivered the next time you open
   Spotify (for up to 12 hours).
 - If Spotify is fully closed, install the optional background notifier (see

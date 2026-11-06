@@ -78,7 +78,7 @@ not notify everyone who installed the extension.
 6. When you start a sync or request session, FreeJam alerts only your added
    friends. They get a native Windows/macOS notification and a short ding, and
    can click "Join jam" in their panel.
-7. Click "Test alert" once to allow desktop notifications for Spotify.
+7. Open Settings and turn on "Desktop notifications" to allow them for Spotify.
 
 Your friend code contains a send key, not your private receive key, so a
 friend can send you a jam but cannot read your mailbox or impersonate you.
@@ -91,7 +91,7 @@ from the notifier folder:
   Windows: powershell -ExecutionPolicy Bypass -File .\install-notifier.ps1
   macOS:   bash install-notifier-macos.sh
 
-Copy the setup code from Friends -> "Alerts while Spotify is closed" and paste
+Copy the setup code from Settings -> "Alerts while Spotify is closed" and paste
 it into the installer. The code contains your private receive key, so do not
 share it. Re-copy the code after adding or removing friends.
 
