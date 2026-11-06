@@ -54,7 +54,6 @@ player, not Spotify Jam.
 | `README.md` | This file: usage plus the full relay guide. |
 | `DEPLOY.md` | Short deployment recipes (Render, Cloudflare, VPS, Docker). |
 | `PI-SETUP.md` | Complete Raspberry Pi / home-server walkthrough. |
-| `PI-README.md` | Notes for the specific Pi deployment in this project. |
 | `freejam-relay.service` | systemd unit for the relay. |
 | `freejam-tunnel.service` | systemd unit for a Cloudflare quick tunnel. |
 | `Dockerfile`, `render.yaml` | Container and Render deployment helpers. |
@@ -123,10 +122,10 @@ If `freejam-relay.js` changes, the `post-merge` hook can copy it to a remote
 host and restart the service. Configure the target once:
 
 ```powershell
-$env:FREEJAM_PI_HOST = "relay.example.com"    # required, Tailscale address in this project
-$env:FREEJAM_PI_USER = "pi"          # optional, default pi
-$env:FREEJAM_PI_DIR = "~/freejam"         # optional
-$env:FREEJAM_PI_SERVICE = "freejam-relay" # optional
+$env:FREEJAM_PI_HOST = "relay.example.com"   # required: your relay host or IP
+$env:FREEJAM_PI_USER = "pi"                  # optional: SSH user, default pi
+$env:FREEJAM_PI_DIR = "~/freejam"            # optional
+$env:FREEJAM_PI_SERVICE = "freejam-relay"    # optional
 git pull
 ```
 
@@ -140,8 +139,8 @@ If the host is offline, the script prints a warning and does not block the pull.
 Without `FREEJAM_PI_HOST`, relay changes are skipped. The manual fallback is:
 
 ```bash
-scp freejam-relay.js pi@<host>:~/freejam/
-ssh pi@<host> "sudo systemctl restart freejam-relay"
+scp freejam-relay.js <user>@<host>:~/freejam/
+ssh <user>@<host> "sudo systemctl restart freejam-relay"
 ```
 
 ---
@@ -1007,32 +1006,36 @@ in the same public message.
 | Offline alert lost | Relay restarted | Pending alerts are in memory; ask the host to resend. |
 | Render takes ~1 minute | Free service was asleep | Wait; FreeJam retries with backoff. |
 
-## 12. Reference deployment in this project
+## 12. Example: an always-on home relay
 
-This repository is also deployed on a Raspberry Pi 5:
+This is the layout many people use for a small friend group. Nothing here is
+required, and every value is a placeholder you replace with your own.
 
-- Pi reachable over Tailscale as `relay-host` (`relay.example.com`).
-- Relay runs as the `freejam-relay` systemd service on `127.0.0.1:8787`.
-- A Cloudflare quick tunnel (`freejam-tunnel` service) exposes it publicly as
-  `wss://...trycloudflare.com`.
-- Tailscale is used for administration and deployment, not by guests.
-- The relay directory is `~/freejam`.
-- On the host PC, automatic deploys use `FREEJAM_PI_HOST=relay.example.com`.
+- An always-on machine (a Raspberry Pi, mini PC, or spare laptop) on your
+  network. Call it `<relay-host>`.
+- The relay runs as a systemd service (or Windows service) bound to
+  `127.0.0.1:8787`.
+- A Cloudflare quick tunnel, or a named tunnel with your own domain, exposes it
+  publicly as `wss://<your-relay-hostname>`.
+- A private VPN such as Tailscale is optional and only for administration and
+  deployment, never for guests.
+- The relay directory is `~/freejam` on that machine.
+- On the machine where you run `git pull`, automatic deploys use
+  `FREEJAM_PI_HOST=<relay-host>`.
 
-Useful commands on the Pi:
+Useful commands on the relay machine:
 
 ```bash
-freejam-url                              # print the current public URL
 systemctl status freejam-relay freejam-tunnel
 journalctl -u freejam-relay -f
 journalctl -u freejam-tunnel -n 50 --no-pager | grep trycloudflare
 sudo systemctl restart freejam-relay freejam-tunnel
 ```
 
-Because it is a quick tunnel, the public hostname changes if the Pi or
+With a quick tunnel, the public hostname changes if the machine or
 `cloudflared` restarts. After a change:
 
-1. Run `freejam-url`.
+1. Read the new URL from the `cloudflared` output (or your own helper script).
 2. Start a fresh sync session on the host.
 3. In the Friends card, click **Save relay** with the new URL.
 4. Copy your friend code again so friends update theirs.

@@ -11,13 +11,13 @@ param(
 # the systemd service.
 #
 # Configure once with environment variables, or pass parameters:
-#   FREEJAM_PI_HOST      hostname or IP, e.g. 192.168.x.x
+#   FREEJAM_PI_HOST      hostname or IP, e.g. relay.example.com
 #   FREEJAM_PI_USER      SSH user, default pi
 #   FREEJAM_PI_DIR       remote directory, default ~/freejam
 #   FREEJAM_PI_SERVICE   systemd unit, default freejam-relay
 #
 # Example:
-#   .\scripts\deploy-relay.ps1 -PiHost 192.168.x.x
+#   .\scripts\deploy-relay.ps1 -PiHost relay.example.com
 #
 # If the Pi is offline this script prints a warning and exits 0, so a git pull
 # is never blocked by a sleeping Pi.
