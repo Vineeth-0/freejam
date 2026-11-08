@@ -1348,6 +1348,9 @@
         sync.name || (sync.role === "host" ? "Host" : "Guest")
       );
       url.searchParams.set("role", sync.role);
+      if (friends.identity && friends.identity.userId) {
+        url.searchParams.set("uid", friends.identity.userId);
+      }
     } catch (err) {
       sync.error = "Invalid relay URL.";
       refreshSyncPanel();
@@ -1375,7 +1378,7 @@
       sendSync({ t: "hello", name: sync.name, role: sync.role });
       startSyncTimers();
       if (sync.role === "guest") sendSync({ t: "cmd", action: "sync" });
-      refreshSyncPanel();
+      refreshPanelSections();
     };
 
     socket.onmessage = (event) => {
@@ -1392,7 +1395,7 @@
     socket.onerror = () => {
       if (sync.ws !== socket) return;
       sync.error = "Relay connection error.";
-      refreshSyncPanel();
+      refreshPanelSections();
     };
 
     socket.onclose = (event) => {
@@ -1410,9 +1413,19 @@
         sync.error = "This sync session is full.";
       } else if (code === 4005) {
         sync.error = "This host connection was replaced by a newer one.";
+      } else if (code === 4006) {
+        // The host removed this guest. Do not reconnect.
+        sync.error = "You were removed from the sync session by the host.";
+        leaveSync(true);
+        Spicetify.showNotification(
+          "You were removed from the sync session by the host.",
+          true,
+          6000
+        );
+        return;
       }
 
-      refreshSyncPanel();
+      refreshPanelSections();
 
       // A wrong key, a full room, or a replaced host will not fix itself by
       // retrying — and reconnecting as the replaced host would fight forever.
@@ -1503,7 +1516,7 @@
         sync.hostId = null;
         sync.hostName = null;
       }
-      refreshSyncPanel();
+      refreshPanelSections();
       return;
     }
 
@@ -1529,9 +1542,21 @@
       return;
     }
 
+    if (message.t === "kicked") {
+      if (sync.role !== "guest") return;
+      const by = String(message.by || "the host");
+      leaveSync(true);
+      Spicetify.showNotification(
+        `Removed from the sync session by ${by}.`,
+        true,
+        6000
+      );
+      return;
+    }
+
     if (message.t === "error") {
       sync.error = String(message.message || "Relay error.");
-      refreshSyncPanel();
+      refreshPanelSections();
     }
   }
 
@@ -2026,7 +2051,7 @@
     }
   }
 
-  function leaveSync() {
+  function leaveSync(silent = false) {
     if (sync.role === "host") clearFriendsJam();
     closeSyncSocket();
 
@@ -2059,8 +2084,10 @@
       }
     }
 
-    refreshSyncPanel();
-    Spicetify.showNotification("Left the playback sync session.");
+    refreshPanelSections();
+    if (!silent) {
+      Spicetify.showNotification("Left the playback sync session.");
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -2453,7 +2480,7 @@
       state.lastRelayUrl = sync.relayUrl;
       saveState();
       connectSync();
-      refreshSyncPanel();
+      refreshPanelSections();
       Spicetify.showNotification(`Joining ${jam.fromName || "your friend"}'s sync.`);
       clearIncomingJam();
       return;
@@ -3240,9 +3267,23 @@
     return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
   }
 
+  function syncMemberForFriend(friend) {
+    if (!friend || sync.role !== "host") return null;
+    return (
+      sync.members.find(
+        (member) =>
+          member &&
+          member.role !== "host" &&
+          member.uid &&
+          member.uid === friend.userId
+      ) || null
+    );
+  }
+
   function buildFriendRow(friend) {
     const row = el("div", "fj-item");
     const online = friends.online.has(friend.userId);
+    const member = syncMemberForFriend(friend);
 
     const avatar = el(
       "span",
@@ -3256,10 +3297,22 @@
 
     const info = el("div", "fj-item-info");
     info.append(el("div", "fj-item-name", friend.name));
-    info.append(el("div", "fj-item-meta", online ? "online" : "offline"));
+    info.append(
+      el(
+        "div",
+        "fj-item-meta",
+        member ? "in this sync" : online ? "online" : "offline"
+      )
+    );
     row.append(info);
 
-    if (buildLocalJam()) {
+    if (member) {
+      const kick = el("button", "fj-btn secondary", "Kick");
+      kick.dataset.action = "friendsKick";
+      kick.dataset.friendId = friend.userId;
+      kick.dataset.memberId = member.id;
+      row.append(kick);
+    } else if (buildLocalJam()) {
       const invite = el("button", "fj-btn secondary", "Invite");
       invite.dataset.action = "friendsInviteOne";
       invite.dataset.friendId = friend.userId;
@@ -3617,6 +3670,12 @@
       friends.incomingJam
         ? `${friends.incomingJam.from}|${friends.incomingJam.at}|${friends.incomingJam.mode}`
         : "",
+      state.playlistUri && state.inviteUrl ? "request-jam" : "",
+      sync.role === "host" && sync.sessionId
+        ? `host:${sync.sessionId}:${sync.members
+            .map((member) => `${member.id}:${member.uid || ""}`)
+            .join(",")}`
+        : "",
     ].join("|");
 
     if (container.dataset.renderKey === key) return;
@@ -3699,6 +3758,14 @@
 
     container.dataset.renderKey = "";
     renderSyncSection(container);
+  }
+
+  // Re-render every part of the open modal that can change when sync or friend
+  // state changes. Render keys keep this cheap: only sections whose content
+  // actually changed are rebuilt.
+  function refreshPanelSections() {
+    updateButton();
+    updatePanel();
   }
 
   function buildRequestRow(item) {
@@ -4110,6 +4177,49 @@
           Spicetify.showNotification(`Jam invite sent to ${friend.name}.`);
           break;
         }
+        case "friendsKick": {
+          const friend = friends.list.find(
+            (item) => item.userId === button.dataset.friendId
+          );
+          if (!friend) return;
+          if (sync.role !== "host" || !sync.connected) {
+            Spicetify.showNotification(
+              "Start hosting a sync session before removing a friend from it.",
+              true
+            );
+            refreshPanelSections();
+            return;
+          }
+
+          const member = syncMemberForFriend(friend);
+          if (!member) {
+            Spicetify.showNotification(
+              `${friend.name} is no longer in this sync session.`,
+              true
+            );
+            refreshPanelSections();
+            return;
+          }
+
+          if (!sendSync({ t: "kick", target: member.id })) {
+            Spicetify.showNotification(
+              "Could not reach the relay to remove that friend.",
+              true
+            );
+            return;
+          }
+
+          // Update the open modal immediately; the relay also broadcasts fresh
+          // presence once the guest socket closes.
+          sync.members = sync.members.filter(
+            (item) => item && item.id !== member.id
+          );
+          refreshPanelSections();
+          Spicetify.showNotification(
+            `${friend.name} was removed from the sync session.`
+          );
+          break;
+        }
         case "friendsCreate": {
           const nameInput = $('[data-fj="friendName"]', ui.root);
           const relayInput = $('[data-fj="friendRelay"]', ui.root);
@@ -4314,7 +4424,7 @@
           saveState();
           connectSync();
           announceJam();
-          refreshSyncPanel();
+          refreshPanelSections();
           break;
         }
         case "syncJoin": {
@@ -4339,7 +4449,7 @@
           state.lastRelayUrl = normalizeRelayUrl(config.relayUrl);
           saveState();
           connectSync();
-          refreshSyncPanel();
+          refreshPanelSections();
           break;
         }
         case "syncCopyCode": {
@@ -4370,7 +4480,7 @@
             button.textContent = "Click again to leave";
             setTimeout(() => {
               syncLeaveArmedUntil = 0;
-              refreshSyncPanel();
+              refreshPanelSections();
             }, 4100);
             return;
           }

@@ -11,8 +11,9 @@
  *
  * The relay does two jobs:
  *
- *   1. Sync sessions. One "room" per session id forwards playback state and
- *      commands between the host and guests. Nothing is stored.
+ *   1. Sync sessions. One "room" per session id forwards playback state,
+ *      commands and host-only kicks between the host and guests. Nothing is
+ *      stored.
  *
  *   2. Friend mailboxes. Each user owns a mailbox keyed by a random user id.
  *      Friends send a jam invite directly to that mailbox using the owner's
@@ -73,6 +74,7 @@ class Client {
     this.kind = "session";
     this.clientKind = "app";
     this.userId = "";
+    this.uid = "";
     this.friends = null;
     this.watching = new Set();
     this.buffer = Buffer.alloc(0);
@@ -193,6 +195,7 @@ function broadcastPresence(room) {
     id: client.id,
     name: client.name,
     role: client.role,
+    uid: client.uid || "",
   }));
 
   const message = {
@@ -468,10 +471,35 @@ function handleMessage(client, raw) {
 
   if (message.t === "hello") {
     const name = safeString(message.name, 64);
-    const role = message.role === "host" ? "host" : "guest";
     if (name) client.name = name;
-    client.role = role;
+    // The role is fixed by the connection URL. A guest must not be able to
+    // claim the host role by sending hello, or it could kick or spoof state.
     broadcastPresence(client.room);
+    return;
+  }
+
+  // Only the host may remove a guest. The target is matched by connection id,
+  // never by a name or user id, so a kick cannot hit the wrong socket.
+  if (message.t === "kick") {
+    if (client.role !== "host") return;
+    const targetId = safeString(message.target, 64);
+    if (!targetId || targetId === client.id) return;
+
+    let target = null;
+    for (const other of client.room.clients) {
+      if (other.id === targetId && other.role !== "host") {
+        target = other;
+        break;
+      }
+    }
+    if (!target) return;
+
+    target.send({
+      t: "kicked",
+      by: client.name || "the host",
+      reason: "Removed from the sync session",
+    });
+    target.close(4006, "Removed by the host");
     return;
   }
 
@@ -552,6 +580,7 @@ server.on("upgrade", (req, socket) => {
 
   const session = safeString(url.searchParams.get("session"), 128);
   const userId = safeString(url.searchParams.get("user"), 128);
+  const uid = safeString(url.searchParams.get("uid"), 128);
   const roomKey = safeString(url.searchParams.get("key"), 256);
   const id = safeString(url.searchParams.get("id"), 64) || crypto.randomBytes(8).toString("hex");
   const name = safeString(url.searchParams.get("name"), 64) || "Listener";
@@ -631,6 +660,7 @@ server.on("upgrade", (req, socket) => {
     client.kind = "mailbox";
     client.clientKind = clientKind;
     client.userId = userId;
+    client.uid = userId;
     box.clients.add(client);
 
     console.log(
@@ -677,6 +707,7 @@ server.on("upgrade", (req, socket) => {
     collection = rooms;
     collectionKey = session;
     client = new Client(socket, room, session, roomKey, id, name, role);
+    client.uid = uid;
     room.clients.add(client);
 
     console.log(
