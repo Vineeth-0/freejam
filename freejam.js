@@ -2591,6 +2591,11 @@
         list-style: none;
         user-select: none;
       }
+      .fj-section > summary:focus-visible,
+      .fj-input:focus-visible {
+        outline: 3px solid #7fc8ff;
+        outline-offset: 2px;
+      }
       .fj-section > summary::-webkit-details-marker {
         display: none;
       }
@@ -2782,6 +2787,14 @@
       }
       .fj-btn:active {
         transform: scale(0.97);
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .fj-btn {
+          transition: none;
+        }
+        .fj-btn:active {
+          transform: none;
+        }
       }
       .fj-btn:focus-visible {
         outline: 2px solid var(--fj-accent, #1db954);
