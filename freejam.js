@@ -47,6 +47,7 @@
 
   const FRIENDS_STORAGE_KEY = "freejam:friends:v1";
   const ALERTS_STORAGE_KEY = "freejam:alerts:v1";
+  const LAYOUT_STORAGE_KEY = "freejam:layout:v1";
   const FRIEND_CODE_PREFIX = "FJF1.";
   const NOTIFIER_CODE_PREFIX = "FJN1.";
   const FRIEND_PING_INTERVAL_MS = 15000;
@@ -93,6 +94,18 @@
     os: true,
     sound: true,
   };
+
+  // Which parts of the panel are visible. Settings always stays visible so
+  // people can bring back anything they hid.
+  const DEFAULT_LAYOUT = {
+    session: true,
+    sync: true,
+    friends: true,
+    requests: true,
+    hint: true,
+  };
+
+  const layout = { ...DEFAULT_LAYOUT };
 
   const activeNotifications = new Set();
 
@@ -598,6 +611,31 @@
       );
     } catch (err) {
       console.warn("[FreeJam] Could not save alert settings", err);
+    }
+  }
+
+  function loadLayout() {
+    try {
+      const raw = Spicetify.LocalStorage.get(LAYOUT_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!parsed || parsed.version !== 1) return;
+      for (const key of Object.keys(DEFAULT_LAYOUT)) {
+        layout[key] = parsed[key] !== false;
+      }
+    } catch (err) {
+      console.warn("[FreeJam] Could not load panel layout", err);
+    }
+  }
+
+  function saveLayout() {
+    try {
+      Spicetify.LocalStorage.set(
+        LAYOUT_STORAGE_KEY,
+        JSON.stringify({ version: 1, ...layout })
+      );
+    } catch (err) {
+      console.warn("[FreeJam] Could not save panel layout", err);
     }
   }
 
@@ -2474,41 +2512,124 @@
     style.className = "freejam-styles";
     style.textContent = `
       .fj-root {
+        --fj-accent: var(--spice-button, #1db954);
+        --fj-accent-soft: rgba(29, 185, 84, 0.16);
+        --fj-border: rgba(255, 255, 255, 0.09);
+        --fj-border-strong: rgba(255, 255, 255, 0.18);
+        --fj-radius: 14px;
         display: flex;
         flex-direction: column;
-        gap: 14px;
-        padding: 0 24px 24px;
+        gap: 12px;
+        padding: 0 22px 24px;
         color: var(--spice-text, #fff);
         font-size: 14px;
         line-height: 1.45;
       }
+      .fj-root *,
+      .fj-root *::before,
+      .fj-root *::after {
+        box-sizing: border-box;
+      }
+      .fj-root [hidden] {
+        display: none !important;
+      }
+      .fj-block {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
       .fj-section {
-        border: 1px solid rgba(255, 255, 255, 0.09);
-        border-radius: 10px;
-        background: rgba(255, 255, 255, 0.025);
+        border: 1px solid var(--fj-border);
+        border-radius: var(--fj-radius);
+        background: linear-gradient(
+          180deg,
+          rgba(255, 255, 255, 0.045),
+          rgba(255, 255, 255, 0.015)
+        );
+        overflow: hidden;
+        transition: border-color 0.15s ease;
+      }
+      .fj-section:hover {
+        border-color: var(--fj-border-strong);
       }
       .fj-section > summary {
-        padding: 12px 14px;
+        position: relative;
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        padding: 13px 44px 13px 16px;
         cursor: pointer;
         font-weight: 700;
-        list-style-position: inside;
+        font-size: 13px;
+        list-style: none;
+        user-select: none;
       }
-      .fj-section-body { padding: 0 10px 10px; }
-      .fj-section[open] > summary { margin-bottom: 8px; }
+      .fj-section > summary::-webkit-details-marker {
+        display: none;
+      }
+      .fj-section > summary::after {
+        content: "";
+        position: absolute;
+        top: 50%;
+        right: 18px;
+        width: 8px;
+        height: 8px;
+        margin-top: -6px;
+        border-right: 2px solid var(--spice-subtext, #b3b3b3);
+        border-bottom: 2px solid var(--spice-subtext, #b3b3b3);
+        transform: rotate(45deg);
+        transition: transform 0.15s ease, margin-top 0.15s ease;
+      }
+      .fj-section[open] > summary::after {
+        margin-top: -2px;
+        transform: rotate(-135deg);
+      }
+      .fj-section-label {
+        color: var(--spice-text, #fff);
+      }
+      .fj-section-sub {
+        color: var(--spice-subtext, #b3b3b3);
+        font-size: 11px;
+        font-weight: 500;
+      }
+      .fj-section-body {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        padding: 0 14px 14px;
+      }
       .fj-status {
         display: flex;
         align-items: center;
         gap: 10px;
-        padding: 10px 12px;
-        border-radius: 8px;
-        background: rgba(255, 255, 255, 0.06);
+        padding: 11px 13px;
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.055);
+        font-size: 13px;
+      }
+      .fj-root > .fj-status {
+        padding: 14px 16px;
+        border: 1px solid var(--fj-border);
+        border-radius: var(--fj-radius);
+        background:
+          radial-gradient(
+            130% 180% at 0% 0%,
+            rgba(29, 185, 84, 0.2),
+            transparent 62%
+          ),
+          linear-gradient(
+            135deg,
+            rgba(255, 255, 255, 0.07),
+            rgba(255, 255, 255, 0.015)
+          );
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
       }
       .fj-dot {
         width: 8px;
         height: 8px;
         flex: 0 0 auto;
         border-radius: 50%;
-        background: #1db954;
+        background: var(--fj-accent, #1db954);
         box-shadow: 0 0 0 4px rgba(29, 185, 84, 0.18);
       }
       .fj-dot.off {
@@ -2519,10 +2640,14 @@
         display: flex;
         flex-direction: column;
         gap: 12px;
-        padding: 14px;
-        border: 1px solid rgba(255, 255, 255, 0.09);
-        border-radius: 10px;
-        background: rgba(255, 255, 255, 0.03);
+        padding: 16px;
+        border: 1px solid var(--fj-border);
+        border-radius: 12px;
+        background: linear-gradient(
+          180deg,
+          rgba(255, 255, 255, 0.045),
+          rgba(255, 255, 255, 0.015)
+        );
       }
       .fj-card-head {
         display: flex;
@@ -2532,24 +2657,29 @@
       }
       .fj-card-title {
         font-weight: 700;
-        font-size: 15px;
+        font-size: 14px;
+        letter-spacing: 0.01em;
       }
       .fj-subtitle {
-        font-weight: 600;
-        font-size: 13px;
+        font-weight: 700;
+        font-size: 12px;
+        letter-spacing: 0.02em;
       }
       .fj-badge {
-        padding: 2px 9px;
+        padding: 3px 10px;
+        border: 1px solid rgba(29, 185, 84, 0.24);
         border-radius: 999px;
-        font-size: 11px;
-        font-weight: 700;
-        letter-spacing: 0.04em;
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.06em;
         text-transform: uppercase;
-        background: rgba(29, 185, 84, 0.18);
+        background: var(--fj-accent-soft, rgba(29, 185, 84, 0.16));
         color: #1ed760;
+        white-space: nowrap;
       }
       .fj-badge.off {
-        background: rgba(255, 255, 255, 0.1);
+        border-color: var(--fj-border);
+        background: rgba(255, 255, 255, 0.08);
         color: var(--spice-subtext, #b3b3b3);
       }
       .fj-row {
@@ -2565,22 +2695,34 @@
       }
       .fj-divider {
         height: 1px;
-        background: rgba(255, 255, 255, 0.08);
         margin: 2px 0;
+        background: rgba(255, 255, 255, 0.08);
       }
       .fj-input {
         flex: 1 1 auto;
         min-width: 0;
-        padding: 9px 11px;
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: 6px;
+        padding: 10px 12px;
+        border: 1px solid var(--fj-border);
+        border-radius: 10px;
         outline: none;
         color: inherit;
-        background: rgba(255, 255, 255, 0.07);
+        background: rgba(0, 0, 0, 0.2);
         font: inherit;
+        font-size: 13px;
+        transition: border-color 0.15s ease, box-shadow 0.15s ease,
+          background 0.15s ease;
+      }
+      .fj-input::placeholder {
+        color: var(--spice-subtext, #b3b3b3);
+        opacity: 0.8;
+      }
+      .fj-input:hover {
+        border-color: var(--fj-border-strong);
       }
       .fj-input:focus {
-        border-color: rgba(255, 255, 255, 0.4);
+        border-color: var(--fj-accent, #1db954);
+        background: rgba(0, 0, 0, 0.26);
+        box-shadow: 0 0 0 3px var(--fj-accent-soft, rgba(29, 185, 84, 0.16));
       }
       .fj-name {
         flex: 0 1 140px;
@@ -2590,49 +2732,74 @@
         font-size: 12px;
       }
       .fj-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
         flex: 0 0 auto;
         padding: 9px 16px;
         border: 0;
         border-radius: 999px;
         cursor: pointer;
         font: inherit;
+        font-size: 13px;
         font-weight: 700;
-        background: var(--spice-button, #1db954);
+        background: var(--fj-accent, #1db954);
         color: var(--spice-button-text, #000);
-        transition: transform 0.08s ease, filter 0.08s ease;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+        transition: transform 0.1s ease, filter 0.15s ease,
+          box-shadow 0.15s ease;
       }
       .fj-btn:hover {
         filter: brightness(1.08);
       }
       .fj-btn:active {
-        transform: scale(0.98);
+        transform: scale(0.97);
+      }
+      .fj-btn:focus-visible {
+        outline: 2px solid var(--fj-accent, #1db954);
+        outline-offset: 2px;
       }
       .fj-btn.secondary {
-        background: transparent;
+        background: rgba(255, 255, 255, 0.06);
         color: var(--spice-text, #fff);
-        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
+        box-shadow: inset 0 0 0 1px var(--fj-border-strong);
+      }
+      .fj-btn.secondary:hover {
+        background: rgba(255, 255, 255, 0.11);
       }
       .fj-btn.danger {
         background: transparent;
         color: #f15e6c;
-        box-shadow: inset 0 0 0 1px rgba(241, 94, 108, 0.5);
+        box-shadow: inset 0 0 0 1px rgba(241, 94, 108, 0.45);
+      }
+      .fj-btn.ghost {
+        background: transparent;
+        color: var(--spice-subtext, #b3b3b3);
+        box-shadow: none;
+      }
+      .fj-btn.ghost:hover {
+        color: var(--spice-text, #fff);
+      }
+      .fj-btn.small {
+        padding: 5px 11px;
+        font-size: 11px;
       }
       .fj-hint,
       .fj-muted {
         color: var(--spice-subtext, #b3b3b3);
         font-size: 12px;
+        line-height: 1.5;
       }
       .fj-setting {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 14px;
-        padding: 10px 0;
-        border-top: 1px solid rgba(255, 255, 255, 0.06);
+        padding: 12px 0;
       }
-      .fj-setting:first-of-type {
-        border-top: 0;
-        padding-top: 0;
+      .fj-setting + .fj-setting {
+        border-top: 1px solid rgba(255, 255, 255, 0.06);
       }
       .fj-setting-text {
         min-width: 0;
@@ -2645,32 +2812,39 @@
         margin-top: 2px;
         color: var(--spice-subtext, #b3b3b3);
         font-size: 12px;
+        line-height: 1.4;
       }
       .fj-switch {
         position: relative;
         flex: 0 0 auto;
-        width: 42px;
-        height: 24px;
+        width: 40px;
+        height: 22px;
         padding: 0;
         border: 0;
         border-radius: 999px;
-        background: rgba(255, 255, 255, 0.22);
+        background: rgba(255, 255, 255, 0.18);
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
         cursor: pointer;
-        transition: background 0.15s ease;
+        transition: background 0.15s ease, box-shadow 0.15s ease;
       }
       .fj-switch::after {
         content: "";
         position: absolute;
         top: 3px;
         left: 3px;
-        width: 18px;
-        height: 18px;
+        width: 16px;
+        height: 16px;
         border-radius: 50%;
         background: #fff;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
         transition: transform 0.15s ease;
       }
+      .fj-switch:hover {
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.24);
+      }
       .fj-switch[aria-checked="true"] {
-        background: var(--spice-button, #1db954);
+        background: var(--fj-accent, #1db954);
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
       }
       .fj-switch[aria-checked="true"]::after {
         transform: translateX(18px);
@@ -2679,9 +2853,14 @@
         opacity: 0.45;
         cursor: default;
       }
+      .fj-switch:focus-visible {
+        outline: 2px solid var(--fj-accent, #1db954);
+        outline-offset: 2px;
+      }
       .fj-warn {
         color: #f6c358;
         font-size: 12px;
+        line-height: 1.5;
       }
       .fj-now {
         display: flex;
@@ -2691,21 +2870,24 @@
       }
       .fj-now-name {
         color: var(--spice-text, #fff);
+        font-weight: 600;
       }
       .fj-list {
         display: flex;
         flex-direction: column;
+        gap: 2px;
       }
       .fj-item {
         display: flex;
-        gap: 10px;
+        gap: 12px;
         align-items: center;
-        padding: 8px 0;
-        border-top: 1px solid rgba(255, 255, 255, 0.06);
+        padding: 9px 8px;
+        margin: 0 -8px;
+        border-radius: 10px;
+        transition: background 0.12s ease;
       }
-      .fj-item:first-child {
-        border-top: 0;
-        padding-top: 0;
+      .fj-item:hover {
+        background: rgba(255, 255, 255, 0.045);
       }
       .fj-item-info {
         flex: 1 1 auto;
@@ -2724,17 +2906,58 @@
         text-overflow: ellipsis;
         white-space: nowrap;
       }
+      .fj-avatar {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: 0 0 auto;
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        color: #fff;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.02em;
+        background: linear-gradient(135deg, #2a6b45, #1db954);
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.15);
+      }
+      .fj-avatar.off {
+        background: linear-gradient(135deg, #3a3a3a, #565656);
+        color: rgba(255, 255, 255, 0.75);
+      }
+      .fj-avatar .fj-dot {
+        position: absolute;
+        right: -1px;
+        bottom: -1px;
+        width: 10px;
+        height: 10px;
+        border: 2px solid var(--spice-card, #121212);
+        box-shadow: none;
+      }
+      .fj-avatar .fj-dot.off {
+        background: #888;
+      }
       .fj-empty {
-        padding: 8px 0;
+        padding: 10px 0;
         color: var(--spice-subtext, #b3b3b3);
         font-size: 12px;
       }
       .fj-sync-status {
-        background: rgba(255, 255, 255, 0.04);
+        padding: 10px 12px;
+        border: 1px solid var(--fj-border);
+        background: rgba(0, 0, 0, 0.16);
+        font-size: 12px;
       }
       .fj-jam {
         flex-wrap: wrap;
-        background: rgba(29, 185, 84, 0.12);
+        padding: 12px;
+        border: 1px solid rgba(29, 185, 84, 0.3);
+        background: linear-gradient(
+          135deg,
+          rgba(29, 185, 84, 0.18),
+          rgba(29, 185, 84, 0.05)
+        );
       }
     `;
     document.head.appendChild(style);
@@ -3007,22 +3230,33 @@
     return wrap;
   }
 
+  function friendInitials(name) {
+    const parts = String(name || "")
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+    if (parts.length === 0) return "?";
+    if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+    return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
+  }
+
   function buildFriendRow(friend) {
     const row = el("div", "fj-item");
+    const online = friends.online.has(friend.userId);
 
+    const avatar = el(
+      "span",
+      `fj-avatar${online ? "" : " off"}`,
+      friendInitials(friend.name)
+    );
     const dot = el("span", "fj-dot");
-    if (!friends.online.has(friend.userId)) dot.classList.add("off");
-    row.append(dot);
+    if (!online) dot.classList.add("off");
+    avatar.append(dot);
+    row.append(avatar);
 
     const info = el("div", "fj-item-info");
     info.append(el("div", "fj-item-name", friend.name));
-    info.append(
-      el(
-        "div",
-        "fj-item-meta",
-        friends.online.has(friend.userId) ? "online" : "offline"
-      )
-    );
+    info.append(el("div", "fj-item-meta", online ? "online" : "offline"));
     row.append(info);
 
     if (buildLocalJam()) {
@@ -3059,7 +3293,7 @@
     return button;
   }
 
-  function buildSettingsCard() {
+  function buildNotificationCard() {
     const wrap = el("div", "fj-card");
 
     const head = el("div", "fj-card-head");
@@ -3126,26 +3360,6 @@
         actionButton("settingsCopyNotifier", "Copy setup code", "secondary")
       );
       wrap.append(backgroundActions);
-
-      wrap.append(el("div", "fj-divider"));
-      wrap.append(el("div", "fj-subtitle", "Friend relay"));
-      wrap.append(
-        el(
-          "div",
-          "fj-hint",
-          "The server you and your friends use for jam alerts. Everyone needs the same relay."
-        )
-      );
-      const relayRow = el("div", "fj-row");
-      const relayInput = document.createElement("input");
-      relayInput.className = "fj-input";
-      relayInput.placeholder = "wss://your-relay.example.com";
-      relayInput.value = friends.identity.relayUrl || "";
-      relayInput.dataset.fj = "settingsRelayEdit";
-      const saveRelay = el("button", "fj-btn secondary", "Save");
-      saveRelay.dataset.action = "settingsSaveRelay";
-      relayRow.append(relayInput, saveRelay);
-      wrap.append(relayRow);
     } else {
       wrap.append(el("div", "fj-divider"));
       wrap.append(
@@ -3160,6 +3374,83 @@
     return wrap;
   }
 
+  function buildLayoutCard() {
+    const wrap = el("div", "fj-card");
+
+    const head = el("div", "fj-card-head");
+    head.append(el("div", "fj-card-title", "Panel sections"));
+    const headActions = el("div", "fj-actions");
+    const compact = el("button", "fj-btn ghost small", "Compact");
+    compact.dataset.action = "settingsCompactSections";
+    const showAll = el("button", "fj-btn ghost small", "Show all");
+    showAll.dataset.action = "settingsResetSections";
+    headActions.append(compact, showAll);
+    head.append(headActions);
+    wrap.append(head);
+
+    wrap.append(
+      el(
+        "div",
+        "fj-hint",
+        "Hide the parts of the panel you do not use. Compact keeps the session and friends cards and hides the rest. Settings always stays visible."
+      )
+    );
+
+    const sections = [
+      ["session", "Session card", "Start a session or manage the active one."],
+      ["sync", "Playback sync", "Relay setup for synced playback."],
+      ["friends", "Friends", "Friend codes and your friend list."],
+      ["requests", "Recent requests", "The request inbox summary."],
+      ["hint", "Help text", "The explanation at the bottom of the panel."],
+    ];
+
+    for (const [key, title, description] of sections) {
+      const control = switchButton("settingsToggleSection", title, layout[key]);
+      control.dataset.section = key;
+      wrap.append(settingRow(title, description, control));
+    }
+
+    return wrap;
+  }
+
+  function buildRelayCard() {
+    if (!friends.identity) return null;
+
+    const wrap = el("div", "fj-card");
+
+    const head = el("div", "fj-card-head");
+    head.append(el("div", "fj-card-title", "Friend relay"));
+    wrap.append(head);
+
+    wrap.append(
+      el(
+        "div",
+        "fj-hint",
+        "The server you and your friends use for jam alerts. Everyone needs the same relay."
+      )
+    );
+
+    const relayRow = el("div", "fj-row");
+    const relayInput = document.createElement("input");
+    relayInput.className = "fj-input";
+    relayInput.placeholder = "wss://your-relay.example.com";
+    relayInput.value = friends.identity.relayUrl || "";
+    relayInput.dataset.fj = "settingsRelayEdit";
+    const saveRelay = el("button", "fj-btn secondary", "Save");
+    saveRelay.dataset.action = "settingsSaveRelay";
+    relayRow.append(relayInput, saveRelay);
+    wrap.append(relayRow);
+
+    return wrap;
+  }
+
+  function buildSettingsCards() {
+    const cards = [buildLayoutCard(), buildNotificationCard()];
+    const relay = buildRelayCard();
+    if (relay) cards.push(relay);
+    return cards;
+  }
+
   function settingsRenderKey() {
     return [
       alerts.os ? "os" : "off",
@@ -3167,6 +3458,9 @@
       notificationPermission(),
       friends.identity ? friends.identity.relayUrl : "none",
       friends.list.map((friend) => friend.userId).join(","),
+      Object.keys(DEFAULT_LAYOUT)
+        .map((key) => (layout[key] ? "1" : "0"))
+        .join(""),
     ].join("|");
   }
 
@@ -3175,7 +3469,7 @@
     const key = settingsRenderKey();
     if (container.dataset.renderKey === key) return;
     container.dataset.renderKey = key;
-    container.replaceChildren(buildSettingsCard());
+    container.replaceChildren(...buildSettingsCards());
   }
 
   function refreshSettingsPanel() {
@@ -3445,6 +3739,15 @@
     }
   }
 
+  function applyLayout() {
+    const root = ui.root;
+    if (!root) return;
+    for (const node of root.querySelectorAll("[data-fj-section]")) {
+      const key = node.dataset.fjSection;
+      node.hidden = layout[key] === false;
+    }
+  }
+
   function updatePanel(forceSessionRender = false) {
     const root = ui.root;
     if (!root || !root.isConnected) {
@@ -3469,7 +3772,9 @@
 
       if (!state.playlistUri && !sync.role) {
         dot.classList.add("off");
-        text = "No active session. Start one below — no Premium needed.";
+        text = layout.session
+          ? "No active session. Start one below — no Premium needed."
+          : "No active session. Turn on Session card in Settings to start one.";
       } else if (state.lastError) {
         dot.classList.add("off");
         text = state.lastError;
@@ -3562,6 +3867,8 @@
           "Request sessions use a collaborative playlist as a shared inbox for song requests; FreeJam creates one automatically, or you can choose an existing playlist. Playback sync is a separate relay mode and does not need a playlist. Use Spotify's normal player controls.";
       }
     }
+
+    applyLayout();
   }
 
   function openPanel() {
@@ -3569,19 +3876,32 @@
     root.className = "fj-root";
     root.innerHTML = `
       <div class="fj-status" data-fj="status"></div>
-      <div data-fj="session"></div>
-      <details class="fj-section"><summary>Playback sync · relay setup</summary><div class="fj-section-body" data-fj="sync"></div></details>
-      <details class="fj-section"><summary>Friends · direct invites</summary><div class="fj-section-body" data-fj="friends"></div></details>
-      <div class="fj-card">
-        <div class="fj-card-head">
-          <span class="fj-card-title">Recent requests</span>
-          <span class="fj-muted" data-fj="count"></span>
+      <section class="fj-block" data-fj-section="session">
+        <div data-fj="session"></div>
+      </section>
+      <details class="fj-section" data-fj-section="sync">
+        <summary><span class="fj-section-label">Playback sync</span><span class="fj-section-sub">Relay setup</span></summary>
+        <div class="fj-section-body" data-fj="sync"></div>
+      </details>
+      <details class="fj-section" data-fj-section="friends">
+        <summary><span class="fj-section-label">Friends</span><span class="fj-section-sub">Codes and invites</span></summary>
+        <div class="fj-section-body" data-fj="friends"></div>
+      </details>
+      <section class="fj-block" data-fj-section="requests">
+        <div class="fj-card">
+          <div class="fj-card-head">
+            <span class="fj-card-title">Recent requests</span>
+            <span class="fj-muted" data-fj="count"></span>
+          </div>
+          <div class="fj-now" data-fj="now"></div>
+          <div class="fj-list" data-fj="requests"></div>
         </div>
-        <div class="fj-now" data-fj="now"></div>
-        <div class="fj-list" data-fj="requests"></div>
-      </div>
-      <details class="fj-section"><summary>Settings</summary><div class="fj-section-body" data-fj="settings"></div></details>
-      <div class="fj-hint" data-fj="hint"></div>
+      </section>
+      <details class="fj-section">
+        <summary><span class="fj-section-label">Settings</span><span class="fj-section-sub">Alerts and panel</span></summary>
+        <div class="fj-section-body" data-fj="settings"></div>
+      </details>
+      <div class="fj-hint" data-fj="hint" data-fj-section="hint"></div>
     `;
     root.addEventListener("click", onPanelClick);
 
@@ -3731,6 +4051,35 @@
           alerts.sound = on;
           saveAlerts();
           if (on) playDing();
+          refreshSettingsPanel();
+          break;
+        }
+        case "settingsToggleSection": {
+          const key = button.dataset.section;
+          if (!key || !(key in DEFAULT_LAYOUT)) return;
+          layout[key] = button.getAttribute("aria-checked") !== "true";
+          saveLayout();
+          applyLayout();
+          refreshSettingsPanel();
+          break;
+        }
+        case "settingsResetSections": {
+          Object.assign(layout, DEFAULT_LAYOUT);
+          saveLayout();
+          applyLayout();
+          refreshSettingsPanel();
+          break;
+        }
+        case "settingsCompactSections": {
+          Object.assign(layout, {
+            session: true,
+            sync: false,
+            friends: true,
+            requests: false,
+            hint: false,
+          });
+          saveLayout();
+          applyLayout();
           refreshSettingsPanel();
           break;
         }
@@ -4128,6 +4477,7 @@
     loadState();
     loadFriends();
     loadAlerts();
+    loadLayout();
     injectStyles();
     createPlaybarButton();
     registerContextMenu();
