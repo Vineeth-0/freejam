@@ -75,6 +75,14 @@ player, not Spotify Jam.
 
 A **FreeJam** button appears in the playbar. Click it to open the panel.
 
+### Panel layout
+
+The panel is built from collapsible sections. Open **Settings → Panel sections**
+to hide anything you do not use: the **Session card**, **Playback sync**,
+**Friends**, **Recent requests**, or the help text. **Compact** keeps only the
+session and friends cards; **Show all** restores everything. Settings always
+stays visible so a hidden section can be brought back.
+
 ---
 
 ## Updating (automatic)

@@ -46,7 +46,10 @@
   const SYNC_CMD_GRACE_MS = 1200;
 
   const FRIENDS_STORAGE_KEY = "freejam:friends:v1";
+  const ALERTS_STORAGE_KEY = "freejam:alerts:v1";
+  const LAYOUT_STORAGE_KEY = "freejam:layout:v1";
   const FRIEND_CODE_PREFIX = "FJF1.";
+  const NOTIFIER_CODE_PREFIX = "FJN1.";
   const FRIEND_PING_INTERVAL_MS = 15000;
   const FRIEND_RECONNECT_MAX_MS = 15000;
   const FRIEND_JAM_NOTIFY_COOLDOWN_MS = 45 * 1000;
@@ -85,6 +88,26 @@
   let endArmedUntil = 0;
   let syncLeaveArmedUntil = 0;
   let lastErrorNotifyAt = 0;
+  let audioContext = null;
+
+  const alerts = {
+    os: true,
+    sound: true,
+  };
+
+  // Which parts of the panel are visible. Settings always stays visible so
+  // people can bring back anything they hid.
+  const DEFAULT_LAYOUT = {
+    session: true,
+    sync: true,
+    friends: true,
+    requests: true,
+    hint: true,
+  };
+
+  const layout = { ...DEFAULT_LAYOUT };
+
+  const activeNotifications = new Set();
 
   const ui = {
     button: null,
@@ -411,6 +434,19 @@
     }
   }
 
+  function encodeNotifierCode(identity) {
+    const payload = JSON.stringify({
+      v: 1,
+      u: identity.relayUrl,
+      id: identity.userId,
+      rk: identity.recvKey,
+      n: identity.name || "A friend",
+      f: friends.list.map((friend) => friend.userId),
+      snd: alerts.sound ? 1 : 0,
+    });
+    return `${NOTIFIER_CODE_PREFIX}${base64UrlEncode(payload)}`;
+  }
+
   // ---------------------------------------------------------------------------
   // Persistence
   // ---------------------------------------------------------------------------
@@ -548,6 +584,239 @@
     } catch (err) {
       console.warn("[FreeJam] Could not save friends", err);
     }
+  }
+
+  function loadAlerts() {
+    try {
+      const raw = Spicetify.LocalStorage.get(ALERTS_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!parsed || parsed.version !== 1) return;
+      alerts.os = parsed.os !== false;
+      alerts.sound = parsed.sound !== false;
+    } catch (err) {
+      console.warn("[FreeJam] Could not load alert settings", err);
+    }
+  }
+
+  function saveAlerts() {
+    try {
+      Spicetify.LocalStorage.set(
+        ALERTS_STORAGE_KEY,
+        JSON.stringify({
+          version: 1,
+          os: alerts.os,
+          sound: alerts.sound,
+        })
+      );
+    } catch (err) {
+      console.warn("[FreeJam] Could not save alert settings", err);
+    }
+  }
+
+  function loadLayout() {
+    try {
+      const raw = Spicetify.LocalStorage.get(LAYOUT_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (!parsed || parsed.version !== 1) return;
+      for (const key of Object.keys(DEFAULT_LAYOUT)) {
+        layout[key] = parsed[key] !== false;
+      }
+    } catch (err) {
+      console.warn("[FreeJam] Could not load panel layout", err);
+    }
+  }
+
+  function saveLayout() {
+    try {
+      Spicetify.LocalStorage.set(
+        LAYOUT_STORAGE_KEY,
+        JSON.stringify({ version: 1, ...layout })
+      );
+    } catch (err) {
+      console.warn("[FreeJam] Could not save panel layout", err);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Desktop alerts and the notification ding
+  // ---------------------------------------------------------------------------
+
+  function systemNotificationsSupported() {
+    return (
+      typeof window !== "undefined" &&
+      typeof window.Notification === "function"
+    );
+  }
+
+  function notificationPermission() {
+    if (!systemNotificationsSupported()) return "unsupported";
+    try {
+      return window.Notification.permission || "default";
+    } catch {
+      return "denied";
+    }
+  }
+
+  function ensureNotificationPermission(request = false) {
+    if (!systemNotificationsSupported()) return Promise.resolve(false);
+    if (notificationPermission() === "granted") return Promise.resolve(true);
+    if (notificationPermission() === "denied" || !request) {
+      return Promise.resolve(false);
+    }
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value === "granted");
+      };
+      const timer = setTimeout(() => done("denied"), 15000);
+
+      try {
+        const maybe = window.Notification.requestPermission(done);
+        if (maybe && typeof maybe.then === "function") {
+          maybe.then(done, () => done("denied"));
+        }
+      } catch {
+        done("denied");
+      }
+    });
+  }
+
+  function getAudioContext() {
+    if (audioContext) return audioContext;
+    const Ctor = window.AudioContext || window.webkitAudioContext;
+    if (!Ctor) return null;
+    try {
+      audioContext = new Ctor();
+    } catch (err) {
+      console.warn("[FreeJam] Could not create the audio context", err);
+      return null;
+    }
+    return audioContext;
+  }
+
+  function primeAudio() {
+    const ctx = getAudioContext();
+    if (ctx && ctx.state === "suspended") {
+      ctx.resume().catch(() => {});
+    }
+  }
+
+  function playDing() {
+    if (!alerts.sound) return;
+    const ctx = getAudioContext();
+    if (!ctx || ctx.state === "closed") return;
+
+    const start = () => {
+      if (ctx.state === "closed") return;
+      const now = ctx.currentTime + 0.02;
+      const master = ctx.createGain();
+      master.gain.setValueAtTime(0.72, now);
+      master.connect(ctx.destination);
+
+      // A soft two-note bell: low warmth, a bright C6, then a G6 sparkle.
+      const notes = [
+        { freq: 523.25, at: 0, dur: 0.42, gain: 0.12 },
+        { freq: 1046.5, at: 0, dur: 0.55, gain: 0.34 },
+        { freq: 1567.98, at: 0.085, dur: 0.66, gain: 0.26 },
+        { freq: 2093.0, at: 0.085, dur: 0.38, gain: 0.07 },
+      ];
+
+      for (const note of notes) {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        const at = now + note.at;
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(note.freq, at);
+        gain.gain.setValueAtTime(0.0001, at);
+        gain.gain.exponentialRampToValueAtTime(note.gain, at + 0.012);
+        gain.gain.exponentialRampToValueAtTime(0.0001, at + note.dur);
+        osc.connect(gain);
+        gain.connect(master);
+        osc.start(at);
+        osc.stop(at + note.dur + 0.05);
+      }
+    };
+
+    if (ctx.state === "suspended") {
+      ctx.resume().then(start).catch(() => {});
+    } else {
+      start();
+    }
+  }
+
+  function showSystemNotification(title, body, options = {}) {
+    if (!alerts.os || !systemNotificationsSupported()) return false;
+    if (notificationPermission() !== "granted") return false;
+
+    try {
+      const notification = new window.Notification(title, {
+        body,
+        tag: options.tag || "freejam",
+        silent: true,
+      });
+      activeNotifications.add(notification);
+
+      const cleanup = () => activeNotifications.delete(notification);
+      notification.onclose = cleanup;
+      notification.onerror = cleanup;
+      notification.onclick = () => {
+        try {
+          window.focus();
+        } catch {
+          /* ignore */
+        }
+        try {
+          notification.close();
+        } catch {
+          /* ignore */
+        }
+      };
+
+      setTimeout(() => {
+        try {
+          notification.close();
+        } catch {
+          /* ignore */
+        }
+      }, 15000);
+      return true;
+    } catch (err) {
+      console.warn("[FreeJam] Desktop notification failed", err);
+      return false;
+    }
+  }
+
+  function showAlert(title, body, options = {}) {
+    const shown = showSystemNotification(title, body, options);
+    if (!shown) {
+      const text = title === "FreeJam" ? body : `${title} — ${body}`;
+      Spicetify.showNotification(
+        text,
+        Boolean(options.error),
+        options.duration || 8000
+      );
+    }
+    if (alerts.sound && options.sound !== false) playDing();
+    return shown;
+  }
+
+  function showJamAlert(jam) {
+    const what =
+      jam.mode === "sync" ? "a playback sync" : "a listening session";
+    return showAlert(
+      `${jam.fromName || "A friend"} started ${what}`,
+      "Open FreeJam to join.",
+      {
+        tag: `freejam-jam-${jam.from || "friend"}`,
+        duration: 8000,
+      }
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -1832,6 +2101,7 @@
       url.searchParams.set("key", friends.identity.recvKey);
       url.searchParams.set("id", friends.selfId);
       url.searchParams.set("name", friendIdentityName());
+      url.searchParams.set("client", "app");
     } catch {
       friends.error = "Invalid relay URL.";
       refreshFriendsPanel();
@@ -2067,15 +2337,12 @@
       return;
     }
 
-    if (Date.now() - friends.lastNotifyAt >= FRIEND_JAM_NOTIFY_COOLDOWN_MS) {
+    if (
+      !jam.suppressNotify &&
+      Date.now() - friends.lastNotifyAt >= FRIEND_JAM_NOTIFY_COOLDOWN_MS
+    ) {
       friends.lastNotifyAt = Date.now();
-      const what =
-        jam.mode === "sync" ? "a playback sync" : "a listening session";
-      Spicetify.showNotification(
-        `${jam.fromName || "A friend"} started ${what}. Open FreeJam to join.`,
-        false,
-        8000
-      );
+      showJamAlert(jam);
     }
 
     updateButton();
@@ -2245,27 +2512,57 @@
     style.className = "freejam-styles";
     style.textContent = `
       .fj-root {
+        --fj-accent: var(--spice-button, #1db954);
+        --fj-accent-soft: rgba(29, 185, 84, 0.16);
+        --fj-border: rgba(255, 255, 255, 0.09);
+        --fj-border-strong: rgba(255, 255, 255, 0.18);
+        --fj-radius: 14px;
         display: flex;
         flex-direction: column;
-        gap: 14px;
-        padding: 0 24px 24px;
+        gap: 12px;
+        padding: 0 22px 24px;
         color: var(--spice-text, #fff);
         font-size: 14px;
         line-height: 1.45;
       }
+      .fj-root *,
+      .fj-root *::before,
+      .fj-root *::after {
+        box-sizing: border-box;
+      }
+      .fj-root [hidden] {
+        display: none !important;
+      }
+      .fj-block {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
       .fj-section {
-        border: 1px solid rgba(255, 255, 255, 0.09);
-        border-radius: 10px;
-        background: rgba(255, 255, 255, 0.025);
+        border: 1px solid var(--fj-border);
+        border-radius: var(--fj-radius);
+        background: linear-gradient(
+          180deg,
+          rgba(255, 255, 255, 0.045),
+          rgba(255, 255, 255, 0.015)
+        );
+        overflow: hidden;
+        transition: border-color 0.15s ease;
+      }
+      .fj-section:hover {
+        border-color: var(--fj-border-strong);
       }
       .fj-section > summary {
-        padding: 12px 14px;
+        position: relative;
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        padding: 13px 44px 13px 16px;
         cursor: pointer;
         font-weight: 700;
-        list-style-position: inside;
-        min-height: 44px;
-        display: flex;
-        align-items: center;
+        font-size: 13px;
+        list-style: none;
+        user-select: none;
       }
       .fj-section > summary:focus-visible,
       .fj-btn:focus-visible,
@@ -2273,22 +2570,72 @@
         outline: 3px solid #7fc8ff;
         outline-offset: 2px;
       }
-      .fj-section-body { padding: 0 10px 10px; }
-      .fj-section[open] > summary { margin-bottom: 8px; }
+      .fj-section > summary::-webkit-details-marker {
+        display: none;
+      }
+      .fj-section > summary::after {
+        content: "";
+        position: absolute;
+        top: 50%;
+        right: 18px;
+        width: 8px;
+        height: 8px;
+        margin-top: -6px;
+        border-right: 2px solid var(--spice-subtext, #b3b3b3);
+        border-bottom: 2px solid var(--spice-subtext, #b3b3b3);
+        transform: rotate(45deg);
+        transition: transform 0.15s ease, margin-top 0.15s ease;
+      }
+      .fj-section[open] > summary::after {
+        margin-top: -2px;
+        transform: rotate(-135deg);
+      }
+      .fj-section-label {
+        color: var(--spice-text, #fff);
+      }
+      .fj-section-sub {
+        color: var(--spice-subtext, #b3b3b3);
+        font-size: 11px;
+        font-weight: 500;
+      }
+      .fj-section-body {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        padding: 0 14px 14px;
+      }
       .fj-status {
         display: flex;
         align-items: center;
         gap: 10px;
-        padding: 10px 12px;
-        border-radius: 8px;
-        background: rgba(255, 255, 255, 0.06);
+        padding: 11px 13px;
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.055);
+        font-size: 13px;
+      }
+      .fj-root > .fj-status {
+        padding: 14px 16px;
+        border: 1px solid var(--fj-border);
+        border-radius: var(--fj-radius);
+        background:
+          radial-gradient(
+            130% 180% at 0% 0%,
+            rgba(29, 185, 84, 0.2),
+            transparent 62%
+          ),
+          linear-gradient(
+            135deg,
+            rgba(255, 255, 255, 0.07),
+            rgba(255, 255, 255, 0.015)
+          );
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
       }
       .fj-dot {
         width: 8px;
         height: 8px;
         flex: 0 0 auto;
         border-radius: 50%;
-        background: #1db954;
+        background: var(--fj-accent, #1db954);
         box-shadow: 0 0 0 4px rgba(29, 185, 84, 0.18);
       }
       .fj-dot.off {
@@ -2299,10 +2646,14 @@
         display: flex;
         flex-direction: column;
         gap: 12px;
-        padding: 14px;
-        border: 1px solid rgba(255, 255, 255, 0.09);
-        border-radius: 10px;
-        background: rgba(255, 255, 255, 0.03);
+        padding: 16px;
+        border: 1px solid var(--fj-border);
+        border-radius: 12px;
+        background: linear-gradient(
+          180deg,
+          rgba(255, 255, 255, 0.045),
+          rgba(255, 255, 255, 0.015)
+        );
       }
       .fj-card-head {
         display: flex;
@@ -2312,24 +2663,29 @@
       }
       .fj-card-title {
         font-weight: 700;
-        font-size: 15px;
+        font-size: 14px;
+        letter-spacing: 0.01em;
       }
       .fj-subtitle {
-        font-weight: 600;
-        font-size: 13px;
+        font-weight: 700;
+        font-size: 12px;
+        letter-spacing: 0.02em;
       }
       .fj-badge {
-        padding: 2px 9px;
+        padding: 3px 10px;
+        border: 1px solid rgba(29, 185, 84, 0.24);
         border-radius: 999px;
-        font-size: 11px;
-        font-weight: 700;
-        letter-spacing: 0.04em;
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.06em;
         text-transform: uppercase;
-        background: rgba(29, 185, 84, 0.18);
+        background: var(--fj-accent-soft, rgba(29, 185, 84, 0.16));
         color: #1ed760;
+        white-space: nowrap;
       }
       .fj-badge.off {
-        background: rgba(255, 255, 255, 0.1);
+        border-color: var(--fj-border);
+        background: rgba(255, 255, 255, 0.08);
         color: var(--spice-subtext, #b3b3b3);
       }
       .fj-row {
@@ -2345,22 +2701,34 @@
       }
       .fj-divider {
         height: 1px;
-        background: rgba(255, 255, 255, 0.08);
         margin: 2px 0;
+        background: rgba(255, 255, 255, 0.08);
       }
       .fj-input {
         flex: 1 1 auto;
         min-width: 0;
-        padding: 9px 11px;
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: 6px;
+        padding: 10px 12px;
+        border: 1px solid var(--fj-border);
+        border-radius: 10px;
         outline: none;
         color: inherit;
-        background: rgba(255, 255, 255, 0.07);
+        background: rgba(0, 0, 0, 0.2);
         font: inherit;
+        font-size: 13px;
+        transition: border-color 0.15s ease, box-shadow 0.15s ease,
+          background 0.15s ease;
+      }
+      .fj-input::placeholder {
+        color: var(--spice-subtext, #b3b3b3);
+        opacity: 0.8;
+      }
+      .fj-input:hover {
+        border-color: var(--fj-border-strong);
       }
       .fj-input:focus {
-        border-color: #7fc8ff;
+        border-color: var(--fj-accent, #1db954);
+        background: rgba(0, 0, 0, 0.26);
+        box-shadow: 0 0 0 3px var(--fj-accent-soft, rgba(29, 185, 84, 0.16));
       }
       .fj-name {
         flex: 0 1 140px;
@@ -2370,42 +2738,139 @@
         font-size: 12px;
       }
       .fj-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
         flex: 0 0 auto;
-        min-height: 44px;
-        padding: 10px 16px;
+        padding: 9px 16px;
         border: 0;
         border-radius: 999px;
         cursor: pointer;
         font: inherit;
+        font-size: 13px;
         font-weight: 700;
-        background: var(--spice-button, #1db954);
+        background: var(--fj-accent, #1db954);
         color: var(--spice-button-text, #000);
-        transition: transform 0.08s ease, filter 0.08s ease;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+        transition: transform 0.1s ease, filter 0.15s ease,
+          box-shadow 0.15s ease;
       }
       .fj-btn:hover {
         filter: brightness(1.08);
       }
       .fj-btn:active {
-        transform: scale(0.98);
+        transform: scale(0.97);
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .fj-btn { transition: none; }
+        .fj-btn:active { transform: none; }
+      }
+      .fj-btn:focus-visible {
+        outline: 2px solid var(--fj-accent, #1db954);
+        outline-offset: 2px;
       }
       .fj-btn.secondary {
-        background: transparent;
+        background: rgba(255, 255, 255, 0.06);
         color: var(--spice-text, #fff);
-        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
+        box-shadow: inset 0 0 0 1px var(--fj-border-strong);
+      }
+      .fj-btn.secondary:hover {
+        background: rgba(255, 255, 255, 0.11);
       }
       .fj-btn.danger {
         background: transparent;
         color: #f15e6c;
-        box-shadow: inset 0 0 0 1px rgba(241, 94, 108, 0.5);
+        box-shadow: inset 0 0 0 1px rgba(241, 94, 108, 0.45);
+      }
+      .fj-btn.ghost {
+        background: transparent;
+        color: var(--spice-subtext, #b3b3b3);
+        box-shadow: none;
+      }
+      .fj-btn.ghost:hover {
+        color: var(--spice-text, #fff);
+      }
+      .fj-btn.small {
+        padding: 5px 11px;
+        font-size: 11px;
       }
       .fj-hint,
       .fj-muted {
         color: var(--spice-subtext, #b3b3b3);
         font-size: 12px;
+        line-height: 1.5;
+      }
+      .fj-setting {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 12px 0;
+      }
+      .fj-setting + .fj-setting {
+        border-top: 1px solid rgba(255, 255, 255, 0.06);
+      }
+      .fj-setting-text {
+        min-width: 0;
+      }
+      .fj-setting-title {
+        font-weight: 600;
+        font-size: 13px;
+      }
+      .fj-setting-desc {
+        margin-top: 2px;
+        color: var(--spice-subtext, #b3b3b3);
+        font-size: 12px;
+        line-height: 1.4;
+      }
+      .fj-switch {
+        position: relative;
+        flex: 0 0 auto;
+        width: 40px;
+        height: 22px;
+        padding: 0;
+        border: 0;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.18);
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+        cursor: pointer;
+        transition: background 0.15s ease, box-shadow 0.15s ease;
+      }
+      .fj-switch::after {
+        content: "";
+        position: absolute;
+        top: 3px;
+        left: 3px;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: #fff;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+        transition: transform 0.15s ease;
+      }
+      .fj-switch:hover {
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.24);
+      }
+      .fj-switch[aria-checked="true"] {
+        background: var(--fj-accent, #1db954);
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+      }
+      .fj-switch[aria-checked="true"]::after {
+        transform: translateX(18px);
+      }
+      .fj-switch:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+      .fj-switch:focus-visible {
+        outline: 2px solid var(--fj-accent, #1db954);
+        outline-offset: 2px;
       }
       .fj-warn {
         color: #f6c358;
         font-size: 12px;
+        line-height: 1.5;
       }
       .fj-now {
         display: flex;
@@ -2415,21 +2880,24 @@
       }
       .fj-now-name {
         color: var(--spice-text, #fff);
+        font-weight: 600;
       }
       .fj-list {
         display: flex;
         flex-direction: column;
+        gap: 2px;
       }
       .fj-item {
         display: flex;
-        gap: 10px;
+        gap: 12px;
         align-items: center;
-        padding: 8px 0;
-        border-top: 1px solid rgba(255, 255, 255, 0.06);
+        padding: 9px 8px;
+        margin: 0 -8px;
+        border-radius: 10px;
+        transition: background 0.12s ease;
       }
-      .fj-item:first-child {
-        border-top: 0;
-        padding-top: 0;
+      .fj-item:hover {
+        background: rgba(255, 255, 255, 0.045);
       }
       .fj-item-info {
         flex: 1 1 auto;
@@ -2448,27 +2916,58 @@
         text-overflow: ellipsis;
         white-space: nowrap;
       }
+      .fj-avatar {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: 0 0 auto;
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        color: #fff;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.02em;
+        background: linear-gradient(135deg, #2a6b45, #1db954);
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.15);
+      }
+      .fj-avatar.off {
+        background: linear-gradient(135deg, #3a3a3a, #565656);
+        color: rgba(255, 255, 255, 0.75);
+      }
+      .fj-avatar .fj-dot {
+        position: absolute;
+        right: -1px;
+        bottom: -1px;
+        width: 10px;
+        height: 10px;
+        border: 2px solid var(--spice-card, #121212);
+        box-shadow: none;
+      }
+      .fj-avatar .fj-dot.off {
+        background: #888;
+      }
       .fj-empty {
-        padding: 8px 0;
+        padding: 10px 0;
         color: var(--spice-subtext, #b3b3b3);
         font-size: 12px;
       }
       .fj-sync-status {
-        background: rgba(255, 255, 255, 0.04);
+        padding: 10px 12px;
+        border: 1px solid var(--fj-border);
+        background: rgba(0, 0, 0, 0.16);
+        font-size: 12px;
       }
       .fj-jam {
         flex-wrap: wrap;
-        background: rgba(29, 185, 84, 0.12);
-      }
-      @media (max-width: 480px) {
-        .fj-root { padding: 0 12px 16px; gap: 10px; }
-        .fj-row { flex-wrap: wrap; }
-        .fj-row > .fj-btn { flex: 1 1 auto; }
-        .fj-input { min-height: 44px; }
-      }
-      @media (prefers-reduced-motion: reduce) {
-        .fj-btn { transition: none; }
-        .fj-btn:active { transform: none; }
+        padding: 12px;
+        border: 1px solid rgba(29, 185, 84, 0.3);
+        background: linear-gradient(
+          135deg,
+          rgba(29, 185, 84, 0.18),
+          rgba(29, 185, 84, 0.05)
+        );
       }
     `;
     document.head.appendChild(style);
@@ -2741,22 +3240,33 @@
     return wrap;
   }
 
+  function friendInitials(name) {
+    const parts = String(name || "")
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+    if (parts.length === 0) return "?";
+    if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+    return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
+  }
+
   function buildFriendRow(friend) {
     const row = el("div", "fj-item");
+    const online = friends.online.has(friend.userId);
 
+    const avatar = el(
+      "span",
+      `fj-avatar${online ? "" : " off"}`,
+      friendInitials(friend.name)
+    );
     const dot = el("span", "fj-dot");
-    if (!friends.online.has(friend.userId)) dot.classList.add("off");
-    row.append(dot);
+    if (!online) dot.classList.add("off");
+    avatar.append(dot);
+    row.append(avatar);
 
     const info = el("div", "fj-item-info");
     info.append(el("div", "fj-item-name", friend.name));
-    info.append(
-      el(
-        "div",
-        "fj-item-meta",
-        friends.online.has(friend.userId) ? "online" : "offline"
-      )
-    );
+    info.append(el("div", "fj-item-meta", online ? "online" : "offline"));
     row.append(info);
 
     if (buildLocalJam()) {
@@ -2771,6 +3281,213 @@
     row.append(remove);
 
     return row;
+  }
+
+  function settingRow(title, description, control) {
+    const row = el("div", "fj-setting");
+    const text = el("div", "fj-setting-text");
+    text.append(el("div", "fj-setting-title", title));
+    if (description) text.append(el("div", "fj-setting-desc", description));
+    row.append(text, control);
+    return row;
+  }
+
+  function switchButton(action, label, on, disabled) {
+    const button = el("button", "fj-switch");
+    button.type = "button";
+    button.dataset.action = action;
+    button.setAttribute("role", "switch");
+    button.setAttribute("aria-label", label);
+    button.setAttribute("aria-checked", on ? "true" : "false");
+    button.disabled = Boolean(disabled);
+    return button;
+  }
+
+  function buildNotificationCard() {
+    const wrap = el("div", "fj-card");
+
+    const head = el("div", "fj-card-head");
+    head.append(el("div", "fj-card-title", "Notifications"));
+    wrap.append(head);
+
+    const permission = notificationPermission();
+    const osOn = alerts.os && permission === "granted";
+
+    wrap.append(
+      settingRow(
+        "Desktop notifications",
+        "Show a Windows or macOS notification when a friend starts a jam.",
+        switchButton(
+          "settingsToggleOs",
+          "Desktop notifications",
+          osOn,
+          permission === "unsupported"
+        )
+      )
+    );
+
+    wrap.append(
+      settingRow(
+        "Ding sound",
+        "Play a short chime with each alert.",
+        switchButton("settingsToggleSound", "Ding sound", alerts.sound)
+      )
+    );
+
+    let statusText;
+    let statusClass = "fj-hint";
+    if (permission === "unsupported") {
+      statusText =
+        "This Spotify version cannot show desktop notifications. Alerts stay inside Spotify.";
+    } else if (permission === "denied") {
+      statusText =
+        "Notifications are blocked. Allow them for Spotify in your system settings, then turn this on again.";
+      statusClass = "fj-warn";
+    } else if (permission === "granted") {
+      statusText = osOn
+        ? "On. Notifications also appear when Spotify is minimized."
+        : "Desktop notifications are off. Turn them on to get alerts outside Spotify.";
+    } else {
+      statusText =
+        "Turn on desktop notifications to allow Spotify to show them.";
+    }
+    wrap.append(el("div", statusClass, statusText));
+
+    if (friends.identity) {
+      wrap.append(el("div", "fj-divider"));
+      wrap.append(
+        el("div", "fj-subtitle", "Alerts while Spotify is closed")
+      );
+      wrap.append(
+        el(
+          "div",
+          "fj-hint",
+          "Spotify must be running for its own notifications. For alerts when it is fully closed, install the optional background notifier on this device. Re-copy the code after changing your friends or the ding setting."
+        )
+      );
+      const backgroundActions = el("div", "fj-actions");
+      backgroundActions.append(
+        actionButton("settingsCopyNotifier", "Copy setup code", "secondary")
+      );
+      wrap.append(backgroundActions);
+    } else {
+      wrap.append(el("div", "fj-divider"));
+      wrap.append(
+        el(
+          "div",
+          "fj-hint",
+          "Create your friend code in Friends to set up background alerts and the relay."
+        )
+      );
+    }
+
+    return wrap;
+  }
+
+  function buildLayoutCard() {
+    const wrap = el("div", "fj-card");
+
+    const head = el("div", "fj-card-head");
+    head.append(el("div", "fj-card-title", "Panel sections"));
+    const headActions = el("div", "fj-actions");
+    const compact = el("button", "fj-btn ghost small", "Compact");
+    compact.dataset.action = "settingsCompactSections";
+    const showAll = el("button", "fj-btn ghost small", "Show all");
+    showAll.dataset.action = "settingsResetSections";
+    headActions.append(compact, showAll);
+    head.append(headActions);
+    wrap.append(head);
+
+    wrap.append(
+      el(
+        "div",
+        "fj-hint",
+        "Hide the parts of the panel you do not use. Compact keeps the session and friends cards and hides the rest. Settings always stays visible."
+      )
+    );
+
+    const sections = [
+      ["session", "Session card", "Start a session or manage the active one."],
+      ["sync", "Playback sync", "Relay setup for synced playback."],
+      ["friends", "Friends", "Friend codes and your friend list."],
+      ["requests", "Recent requests", "The request inbox summary."],
+      ["hint", "Help text", "The explanation at the bottom of the panel."],
+    ];
+
+    for (const [key, title, description] of sections) {
+      const control = switchButton("settingsToggleSection", title, layout[key]);
+      control.dataset.section = key;
+      wrap.append(settingRow(title, description, control));
+    }
+
+    return wrap;
+  }
+
+  function buildRelayCard() {
+    if (!friends.identity) return null;
+
+    const wrap = el("div", "fj-card");
+
+    const head = el("div", "fj-card-head");
+    head.append(el("div", "fj-card-title", "Friend relay"));
+    wrap.append(head);
+
+    wrap.append(
+      el(
+        "div",
+        "fj-hint",
+        "The server you and your friends use for jam alerts. Everyone needs the same relay."
+      )
+    );
+
+    const relayRow = el("div", "fj-row");
+    const relayInput = document.createElement("input");
+    relayInput.className = "fj-input";
+    relayInput.placeholder = "wss://your-relay.example.com";
+    relayInput.value = friends.identity.relayUrl || "";
+    relayInput.dataset.fj = "settingsRelayEdit";
+    const saveRelay = el("button", "fj-btn secondary", "Save");
+    saveRelay.dataset.action = "settingsSaveRelay";
+    relayRow.append(relayInput, saveRelay);
+    wrap.append(relayRow);
+
+    return wrap;
+  }
+
+  function buildSettingsCards() {
+    const cards = [buildLayoutCard(), buildNotificationCard()];
+    const relay = buildRelayCard();
+    if (relay) cards.push(relay);
+    return cards;
+  }
+
+  function settingsRenderKey() {
+    return [
+      alerts.os ? "os" : "off",
+      alerts.sound ? "sound" : "mute",
+      notificationPermission(),
+      friends.identity ? friends.identity.relayUrl : "none",
+      friends.list.map((friend) => friend.userId).join(","),
+      Object.keys(DEFAULT_LAYOUT)
+        .map((key) => (layout[key] ? "1" : "0"))
+        .join(""),
+    ].join("|");
+  }
+
+  function renderSettingsSection(container) {
+    if (!container) return;
+    const key = settingsRenderKey();
+    if (container.dataset.renderKey === key) return;
+    container.dataset.renderKey = key;
+    container.replaceChildren(...buildSettingsCards());
+  }
+
+  function refreshSettingsPanel() {
+    if (!ui.root) return;
+    const container = $('[data-fj="settings"]', ui.root);
+    if (!container) return;
+    container.dataset.renderKey = "";
+    renderSettingsSection(container);
   }
 
   function buildFriendsCard() {
@@ -2798,7 +3515,7 @@
     let statusText;
     if (!friends.identity.relayUrl) {
       statusDot.classList.add("off");
-      statusText = "Set a relay URL so friends can reach you.";
+      statusText = "Set a relay in Settings so friends can reach you.";
     } else if (!friends.connected) {
       statusDot.classList.add("off");
       statusText = friends.error || "Connecting to the friend relay…";
@@ -2808,17 +3525,6 @@
     }
     status.append(statusDot, el("span", null, statusText));
     wrap.append(status);
-
-    const relayRow = el("div", "fj-row");
-    const relayInput = document.createElement("input");
-    relayInput.className = "fj-input";
-    relayInput.placeholder = "wss://your-relay.example.com";
-    relayInput.value = friends.identity.relayUrl || "";
-    relayInput.dataset.fj = "friendRelayEdit";
-    const saveRelay = el("button", "fj-btn secondary", "Save relay");
-    saveRelay.dataset.action = "friendsSaveRelay";
-    relayRow.append(relayInput, saveRelay);
-    wrap.append(relayRow);
 
     const jam = friends.incomingJam;
     if (jam) {
@@ -3043,6 +3749,15 @@
     }
   }
 
+  function applyLayout() {
+    const root = ui.root;
+    if (!root) return;
+    for (const node of root.querySelectorAll("[data-fj-section]")) {
+      const key = node.dataset.fjSection;
+      node.hidden = layout[key] === false;
+    }
+  }
+
   function updatePanel(forceSessionRender = false) {
     const root = ui.root;
     if (!root || !root.isConnected) {
@@ -3054,6 +3769,7 @@
     const session = $('[data-fj="session"]', root);
     const syncContainer = $('[data-fj="sync"]', root);
     const friendsContainer = $('[data-fj="friends"]', root);
+    const settingsContainer = $('[data-fj="settings"]', root);
     const count = $('[data-fj="count"]', root);
     const now = $('[data-fj="now"]', root);
     const list = $('[data-fj="requests"]', root);
@@ -3066,7 +3782,9 @@
 
       if (!state.playlistUri && !sync.role) {
         dot.classList.add("off");
-        text = "No active session. Start one below — no Premium needed.";
+        text = layout.session
+          ? "No active session. Start one below — no Premium needed."
+          : "No active session. Turn on Session card in Settings to start one.";
       } else if (state.lastError) {
         dot.classList.add("off");
         text = state.lastError;
@@ -3107,6 +3825,7 @@
 
     if (syncContainer) renderSyncSection(syncContainer);
     if (friendsContainer) renderFriendsSection(friendsContainer);
+    if (settingsContainer) renderSettingsSection(settingsContainer);
 
     if (now) {
       now.replaceChildren();
@@ -3158,11 +3877,8 @@
           "Request sessions use a collaborative playlist as a shared inbox for song requests; FreeJam creates one automatically, or you can choose an existing playlist. Playback sync is a separate relay mode and does not need a playlist. Use Spotify's normal player controls.";
       }
     }
-    root.querySelectorAll("input").forEach((input) => {
-      if (!input.hasAttribute("aria-label") && input.placeholder) {
-        input.setAttribute("aria-label", input.placeholder);
-      }
-    });
+
+    applyLayout();
   }
 
   function openPanel() {
@@ -3170,18 +3886,32 @@
     root.className = "fj-root";
     root.innerHTML = `
       <div class="fj-status" data-fj="status"></div>
-      <div data-fj="session"></div>
-      <details class="fj-section"><summary>Playback sync · relay setup</summary><div class="fj-section-body" data-fj="sync"></div></details>
-      <details class="fj-section"><summary>Friends · direct invites</summary><div class="fj-section-body" data-fj="friends"></div></details>
-      <div class="fj-card">
-        <div class="fj-card-head">
-          <span class="fj-card-title">Recent requests</span>
-          <span class="fj-muted" data-fj="count"></span>
+      <section class="fj-block" data-fj-section="session">
+        <div data-fj="session"></div>
+      </section>
+      <details class="fj-section" data-fj-section="sync">
+        <summary><span class="fj-section-label">Playback sync</span><span class="fj-section-sub">Relay setup</span></summary>
+        <div class="fj-section-body" data-fj="sync"></div>
+      </details>
+      <details class="fj-section" data-fj-section="friends">
+        <summary><span class="fj-section-label">Friends</span><span class="fj-section-sub">Codes and invites</span></summary>
+        <div class="fj-section-body" data-fj="friends"></div>
+      </details>
+      <section class="fj-block" data-fj-section="requests">
+        <div class="fj-card">
+          <div class="fj-card-head">
+            <span class="fj-card-title">Recent requests</span>
+            <span class="fj-muted" data-fj="count"></span>
+          </div>
+          <div class="fj-now" data-fj="now"></div>
+          <div class="fj-list" data-fj="requests"></div>
         </div>
-        <div class="fj-now" data-fj="now"></div>
-        <div class="fj-list" data-fj="requests"></div>
-      </div>
-      <div class="fj-hint" data-fj="hint"></div>
+      </section>
+      <details class="fj-section">
+        <summary><span class="fj-section-label">Settings</span><span class="fj-section-sub">Alerts and panel</span></summary>
+        <div class="fj-section-body" data-fj="settings"></div>
+      </details>
+      <div class="fj-hint" data-fj="hint" data-fj-section="hint"></div>
     `;
     root.addEventListener("click", onPanelClick);
 
@@ -3301,6 +4031,81 @@
           );
           break;
         }
+        case "settingsToggleOs": {
+          const on = button.getAttribute("aria-checked") !== "true";
+          if (on) {
+            const granted = await ensureNotificationPermission(true);
+            if (!granted) {
+              alerts.os = false;
+              saveAlerts();
+              refreshSettingsPanel();
+              Spicetify.showNotification(
+                notificationPermission() === "denied"
+                  ? "Allow notifications for Spotify in your system settings, then turn this on again."
+                  : "Spotify did not allow desktop notifications. Alerts will stay inside Spotify.",
+                true,
+                9000
+              );
+              return;
+            }
+            alerts.os = true;
+          } else {
+            alerts.os = false;
+          }
+          saveAlerts();
+          refreshSettingsPanel();
+          break;
+        }
+        case "settingsToggleSound": {
+          const on = button.getAttribute("aria-checked") !== "true";
+          alerts.sound = on;
+          saveAlerts();
+          if (on) playDing();
+          refreshSettingsPanel();
+          break;
+        }
+        case "settingsToggleSection": {
+          const key = button.dataset.section;
+          if (!key || !(key in DEFAULT_LAYOUT)) return;
+          layout[key] = button.getAttribute("aria-checked") !== "true";
+          saveLayout();
+          applyLayout();
+          refreshSettingsPanel();
+          break;
+        }
+        case "settingsResetSections": {
+          Object.assign(layout, DEFAULT_LAYOUT);
+          saveLayout();
+          applyLayout();
+          refreshSettingsPanel();
+          break;
+        }
+        case "settingsCompactSections": {
+          Object.assign(layout, {
+            session: true,
+            sync: false,
+            friends: true,
+            requests: false,
+            hint: false,
+          });
+          saveLayout();
+          applyLayout();
+          refreshSettingsPanel();
+          break;
+        }
+        case "settingsCopyNotifier": {
+          if (!friends.identity) return;
+          const code = encodeNotifierCode(friends.identity);
+          const ok = await copyText(code);
+          Spicetify.showNotification(
+            ok
+              ? "Setup code copied. Paste it into the background notifier installer. Re-copy it after changing your friends or the ding setting."
+              : "Could not copy the setup code.",
+            !ok,
+            8000
+          );
+          break;
+        }
         case "friendsInviteOne": {
           const friend = friends.list.find(
             (item) => item.userId === button.dataset.friendId
@@ -3352,6 +4157,7 @@
           friends.reconnectDelay = 1000;
           connectFriends();
           refreshFriendsPanel();
+          refreshSettingsPanel();
           Spicetify.showNotification(
             "Friend code ready. Copy it and send it to the people you trust."
           );
@@ -3417,6 +4223,7 @@
           saveFriends();
           watchFriends();
           refreshFriendsPanel();
+          refreshSettingsPanel();
 
           if (
             friends.identity &&
@@ -3443,6 +4250,7 @@
           saveFriends();
           watchFriends();
           refreshFriendsPanel();
+          refreshSettingsPanel();
           break;
         }
         case "friendsJoin":
@@ -3457,8 +4265,8 @@
           connectFriends();
           refreshFriendsPanel();
           break;
-        case "friendsSaveRelay": {
-          const input = $('[data-fj="friendRelayEdit"]', ui.root);
+        case "settingsSaveRelay": {
+          const input = $('[data-fj="settingsRelayEdit"]', ui.root);
           const relayUrl = normalizeRelayUrl(input ? input.value : "");
           if (!relayUrl) {
             Spicetify.showNotification("Enter a valid relay URL.", true);
@@ -3473,6 +4281,7 @@
           friends.error = null;
           friends.reconnectDelay = 1000;
           connectFriends();
+          refreshSettingsPanel();
           refreshFriendsPanel();
           Spicetify.showNotification(
             "Friend relay updated. Copy your friend code again so friends can update it."
@@ -3677,9 +4486,18 @@
 
     loadState();
     loadFriends();
+    loadAlerts();
+    loadLayout();
     injectStyles();
     createPlaybarButton();
     registerContextMenu();
+
+    // Browsers only allow audio after a user gesture. Prime the audio context
+    // on the first click so the friend-alert ding can play later.
+    document.addEventListener("pointerdown", primeAudio, {
+      once: true,
+      capture: true,
+    });
 
     try {
       Spicetify.Player.addEventListener("songchange", () => {
