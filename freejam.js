@@ -2560,6 +2560,21 @@
       .fj-root [hidden] {
         display: none !important;
       }
+      /* Keep the modal a modest size: opening a section scrolls inside it instead of growing to fill the screen. */
+      .GenericModal:has(.fj-root),
+      .main-embedded-modal-container:has(.fj-root) {
+        width: min(520px, 92vw) !important;
+        max-width: 520px !important;
+        height: auto !important;
+        max-height: min(82vh, 660px) !important;
+      }
+      .fj-root {
+        max-height: min(66vh, 560px);
+        overflow-y: auto;
+        overscroll-behavior: contain;
+      }
+      .fj-section > summary { cursor: pointer; }
+      .fj-section-body { max-height: min(44vh, 360px); overflow-y: auto; overscroll-behavior: contain; }
       .fj-block {
         display: flex;
         flex-direction: column;
@@ -3122,7 +3137,7 @@
       el(
         "div",
         "fj-hint",
-        "Sync shares playback controls. Everyone needs FreeJam. A relay is a small message server: on the same Wi-Fi you can run it on your PC; for friends elsewhere, use a public wss:// relay or Cloudflare Tunnel. FreeJam does not create or host a relay automatically."
+        "Sync shares playback controls. Everyone needs FreeJam. FreeJam is self-hosted: you run your own relay (node freejam-relay.js), on the same Wi-Fi or through a tunnel you run yourself. There is no shared relay, and FreeJam never starts one for you."
       )
     );
 
@@ -3130,7 +3145,7 @@
     const hostRow = el("div", "fj-row");
     const relayInput = document.createElement("input");
     relayInput.className = "fj-input";
-    relayInput.placeholder = "wss://your-relay.onrender.com";
+    relayInput.placeholder = "Your own relay: ws://YOUR_RELAY_IP:8787";
     relayInput.dataset.fj = "relayUrl";
     relayInput.value = sync.relayUrl || state.lastRelayUrl || "";
     const hostNameInput = document.createElement("input");
@@ -3251,7 +3266,7 @@
     const relayRow = el("div", "fj-row");
     const relayInput = document.createElement("input");
     relayInput.className = "fj-input";
-    relayInput.placeholder = "wss://your-relay.example.com";
+    relayInput.placeholder = "Your own relay: wss://your-relay.example.com";
     relayInput.value = state.lastRelayUrl || sync.relayUrl || "";
     relayInput.dataset.fj = "friendRelay";
     const createButton = el("button", "fj-btn", "Create my friend code");
@@ -3263,7 +3278,7 @@
       el(
         "div",
         "fj-hint",
-        "Use the same public relay as your sync sessions. Friends need to reach it over the internet, so a wss:// URL is best."
+        "Use the relay you host yourself (the same one as your sync sessions). Friends outside your network need a wss:// address."
       )
     );
 
@@ -3492,14 +3507,14 @@
       el(
         "div",
         "fj-hint",
-        "The server you and your friends use for jam alerts. Everyone needs the same relay."
+        "The relay you host yourself for jam alerts. Everyone in the group connects to the same one."
       )
     );
 
     const relayRow = el("div", "fj-row");
     const relayInput = document.createElement("input");
     relayInput.className = "fj-input";
-    relayInput.placeholder = "wss://your-relay.example.com";
+    relayInput.placeholder = "Your own relay: wss://your-relay.example.com";
     relayInput.value = friends.identity.relayUrl || "";
     relayInput.dataset.fj = "settingsRelayEdit";
     const saveRelay = el("button", "fj-btn secondary", "Save");
@@ -3984,12 +3999,24 @@
       <div class="fj-hint" data-fj="hint" data-fj-section="hint"></div>
     `;
     root.addEventListener("click", onPanelClick);
+    // Accordion: opening one section closes the others, so the panel stays small.
+    root.addEventListener(
+      "toggle",
+      (event) => {
+        const opened = event.target;
+        if (!(opened instanceof HTMLDetailsElement) || !opened.open) return;
+        for (const other of root.querySelectorAll("details.fj-section[open]")) {
+          if (other !== opened) other.open = false;
+        }
+      },
+      true
+    );
 
     ui.root = root;
     Spicetify.PopupModal.display({
       title: "FreeJam",
       content: root,
-      isLarge: true,
+      isLarge: false,
     });
     // The popup must be attached before updatePanel() runs: it deliberately
     // skips work for detached roots so a closed modal does not keep rendering.
@@ -4420,7 +4447,7 @@
           );
           if (!relayUrl) {
             Spicetify.showNotification(
-              "Enter the relay WebSocket URL, for example wss://your-relay.onrender.com (or ws://192.168.x.x:8787 on the same Wi-Fi).",
+              "Enter the relay WebSocket URL, for example ws://192.168.x.x:8787 on the same Wi-Fi, or the wss:// address of a tunnel you run yourself.",
               true
             );
             return;
