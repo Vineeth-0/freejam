@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
+User=freejam
 ExecStart=/usr/bin/cloudflared tunnel --url http://127.0.0.1:8787
 Restart=always
 RestartSec=5

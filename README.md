@@ -53,9 +53,7 @@ player, not Spotify Jam.
 | `scripts/build-bundles.ps1` | Rebuilds the release zip files into `dist/`. |
 | `hooks/post-merge` | After `git pull`, updates the extension and optionally deploys the relay. |
 | `hooks/pre-push` | Before `git push`, updates the extension if it changed. |
-| `README.md` | This file: usage plus the full relay guide. |
-| `DEPLOY.md` | Short deployment recipes (Render, Cloudflare, VPS, Docker). |
-| `PI-SETUP.md` | Complete Raspberry Pi / home-server walkthrough. |
+| `README.md` | This file: install, usage, deployment and the full relay guide. |
 | `freejam-relay.service` | systemd unit for the relay. |
 | `freejam-tunnel.service` | systemd unit for a Cloudflare quick tunnel. |
 | `Dockerfile`, `render.yaml` | Container and Render deployment helpers. |
@@ -75,6 +73,20 @@ player, not Spotify Jam.
 3. Run `spicetify apply` and restart Spotify.
 
 A **FreeJam** button appears in the playbar. Click it to open the panel.
+
+### Friend install
+
+Friends only need the extension — not Node.js and not the relay. Send them
+`FreeJam-Friend.zip`, or just `freejam.js` plus the optional `notifier/` folder.
+They copy `freejam.js` into their Spicetify **Extensions** folder, run
+`spicetify apply`, and restart Spotify. Then either:
+
+- paste your `FJ1…` join code under **Playback sync → Join a sync session**, or
+- add your `FJF1…` friend code under **Friends → Add a friend**.
+
+The optional background notifier is only needed for alerts while Spotify is
+fully closed. The full guide is this README; the bundle includes a copy of it as
+`FreeJam-README.md`.
 
 ### Panel layout
 
@@ -133,7 +145,7 @@ host and restart the service. Configure the target once:
 
 ```powershell
 $env:FREEJAM_PI_HOST = "relay.example.com"   # required: your relay host or IP
-$env:FREEJAM_PI_USER = "pi"                  # optional: SSH user, default pi
+$env:FREEJAM_PI_USER = "freejam"             # optional: SSH user, default freejam
 $env:FREEJAM_PI_DIR = "~/freejam"            # optional
 $env:FREEJAM_PI_SERVICE = "freejam-relay"    # optional
 git pull
@@ -666,7 +678,6 @@ Caveats:
 
 A named tunnel gives a permanent hostname such as `relay.example.com`. It
 requires a domain whose DNS is managed by Cloudflare (the free plan is enough).
-See `PI-SETUP.md` for the full walkthrough. The short version:
 
 ```bash
 cloudflared tunnel login
@@ -674,9 +685,22 @@ cloudflared tunnel create freejam
 cloudflared tunnel route dns freejam relay.example.com
 ```
 
-Then point the tunnel's `config.yml` at `http://127.0.0.1:8787` and install it
-as a service. `PI-SETUP.md` has the exact unit and config file. Then use
-`wss://relay.example.com`.
+Create `~/.cloudflared/config.yml`:
+
+```yaml
+tunnel: freejam
+credentials-file: /home/<user>/.cloudflared/<tunnel-id>.json
+
+ingress:
+  - hostname: relay.example.com
+    service: http://127.0.0.1:8787
+  - service: http_status:404
+```
+
+Then run `cloudflared tunnel run freejam` as a service. The included
+`freejam-tunnel.service` is a quick-tunnel example; change its `ExecStart` to
+`/usr/bin/cloudflared tunnel run freejam` and set `User` to the account that owns
+the tunnel. Use `wss://relay.example.com` in FreeJam.
 
 ### 6.5 Render
 
@@ -791,8 +815,10 @@ You should see `FreeJam relay is running.`
 #### Linux / Raspberry Pi (systemd)
 
 The included `freejam-relay.service` assumes the relay is in
-`/home/pi/freejam`, Node is at `/usr/bin/node`, and the service runs as `pi`.
-Edit those if needed.
+`/home/freejam/freejam` (the `freejam` user's home), Node is at `/usr/bin/node`,
+and the service runs as `freejam`. Create that user, or edit those values to
+match your host. The deploy script copies to `~/freejam` by default, which
+matches this layout.
 
 ```bash
 sudo cp freejam-relay.service /etc/systemd/system/freejam-relay.service
@@ -1101,8 +1127,8 @@ With a quick tunnel, the public hostname changes if the machine or
 3. In the Friends card, click **Save relay** with the new URL.
 4. Copy your friend code again so friends update theirs.
 
-For a permanent hostname, switch to a named Cloudflare Tunnel; see
-`PI-SETUP.md`.
+For a permanent hostname, switch to a named Cloudflare Tunnel (see
+[6.4 Named Cloudflare Tunnel](#64-named-cloudflare-tunnel-stable-url)).
 
 ---
 
@@ -1156,15 +1182,59 @@ Spotify is fully quit, because the extension runs inside Spotify.
 
 For that case there is an optional background notifier in `notifier/`. It is a
 small Node.js 18+ helper that connects to the same private mailbox and shows a
-native notification (and the same ding) when Spotify is not running.
+native notification (and the same ding) when Spotify is not running. It has no
+npm dependencies.
+
+Requirements:
+
+- Node.js 18 or newer.
+- The same relay URL and friend list as the FreeJam extension.
+- A notifier setup code from FreeJam.
+
+#### Install
 
 1. Open **Settings** in the FreeJam panel.
-2. Under **Alerts while Spotify is closed**, click **Copy setup code**.
+2. Under **Alerts while Spotify is closed**, click **Copy setup code**. The code
+   starts with `FJN1.`.
 3. Download or clone this repository and open `notifier/`.
-4. Run the installer for your OS and paste the code:
-   - Windows: `powershell -ExecutionPolicy Bypass -File .\install-notifier.ps1`
-   - macOS: `bash install-notifier-macos.sh`
-5. The installer starts it now and registers it to start at login.
+4. Run the installer for your OS and paste the code when asked:
+
+   Windows (PowerShell in the `notifier` folder):
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\install-notifier.ps1
+   ```
+
+   macOS (Terminal in the `notifier` folder):
+
+   ```bash
+   bash install-notifier-macos.sh
+   ```
+
+5. The installer starts the notifier now and registers it to start at login.
+
+Where things go:
+
+- Windows: `%APPDATA%\FreeJam\notifier`, plus a startup shortcut.
+- macOS: `~/Library/Application Support/FreeJam/notifier`, plus a LaunchAgent at
+  `~/Library/LaunchAgents/com.freejam.notifier.plist`.
+
+Test it immediately:
+
+```powershell
+# Windows
+node "$env:APPDATA\FreeJam\notifier\freejam-notifier.js" --test
+```
+
+```bash
+# macOS
+node "$HOME/Library/Application Support/FreeJam/notifier/freejam-notifier.js" --test
+```
+
+Windows shows the alert as a notification-area balloon. If nothing appears,
+check **Settings → System → Notifications** and Focus Assist / Do Not Disturb.
+On macOS, allow notifications for the app that runs `osascript` (Terminal,
+iTerm, or Script Editor) in **System Settings → Notifications**.
 
 The setup code contains your **private `recvKey`**, not your send key. Treat it
 like a password and only install it on your own device. Re-copy the code after
@@ -1176,8 +1246,47 @@ notifier stays silent and the extension raises the alert. If only the notifier
 is connected, it alerts and the relay keeps the jam queued so the app still
 shows a **Join jam** card when it opens.
 
-See [`notifier/README.md`](notifier/README.md) for install details,
-troubleshooting, and uninstall steps.
+#### Uninstall
+
+Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\uninstall-notifier.ps1
+```
+
+macOS:
+
+```bash
+bash uninstall-notifier-macos.sh
+```
+
+Add `-KeepConfig` (Windows) or `--keep-config` (macOS) to keep the saved setup
+code.
+
+#### Run manually
+
+```bash
+node freejam-notifier.js --config /path/to/notifier.json
+```
+
+Useful flags:
+
+- `--install FJN1...` save a setup code
+- `--test` show a test notification
+- `--uninstall` remove the saved config
+- `--help` show usage
+
+#### Notifier troubleshooting
+
+| Problem | Fix |
+| --- | --- |
+| `Node.js 18 or newer is required` | Install Node.js and reopen the terminal. |
+| `The setup code is missing relay details` | Copy a fresh `FJN1...` code from FreeJam. |
+| `The relay rejected the receive key` | The friend identity was recreated. Copy a fresh code. |
+| No notification while Spotify is closed | Check that the notifier is running: Windows Task Manager → `node.exe`, or macOS `launchctl list \| grep freejam`. |
+| Notifications work, but not for a new friend | Re-copy the setup code and run the installer again. |
+| No sound | Check the OS volume and notification sound settings. The notifier generates `ding.wav` next to its config; you can replace it with any WAV file. |
+| Duplicate alerts | The relay suppresses the notifier while the Spotify app is connected. If you see duplicates, update `freejam-relay.js` on the relay. |
 
 ### Sending the invite
 

@@ -7,20 +7,20 @@ param(
     [switch]$DryRun
 )
 
-# Deploy freejam-relay.js to the Raspberry Pi (or any SSH host) and restart
+# Deploy freejam-relay.js to a Raspberry Pi (or any SSH host) and restart
 # the systemd service.
 #
 # Configure once with environment variables, or pass parameters:
 #   FREEJAM_PI_HOST      hostname or IP, e.g. relay.example.com
-#   FREEJAM_PI_USER      SSH user, default pi
+#   FREEJAM_PI_USER      SSH user, default freejam
 #   FREEJAM_PI_DIR       remote directory, default ~/freejam
 #   FREEJAM_PI_SERVICE   systemd unit, default freejam-relay
 #
 # Example:
 #   .\scripts\deploy-relay.ps1 -PiHost relay.example.com
 #
-# If the Pi is offline this script prints a warning and exits 0, so a git pull
-# is never blocked by a sleeping Pi.
+# If the host is offline this script prints a warning and exits 0, so a git pull
+# is never blocked by a sleeping host.
 
 $ErrorActionPreference = "Stop"
 
@@ -34,7 +34,7 @@ if (-not $PiHost) {
     Write-Warning "FREEJAM_PI_HOST / -PiHost is not set; skipping relay deployment."
     return
 }
-if (-not $PiUser) { $PiUser = "pi" }
+if (-not $PiUser) { $PiUser = "freejam" }
 if (-not $RemoteDir) { $RemoteDir = "~/freejam" }
 if (-not $Service) { $Service = "freejam-relay" }
 
@@ -59,7 +59,7 @@ Write-Host "FreeJam: copying relay to $remote..."
 & $scp.Source -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new `
     $source $target
 if ($LASTEXITCODE -ne 0) {
-    Write-Warning "Could not copy the relay to $remote. Is the Pi online and reachable over SSH?"
+    Write-Warning "Could not copy the relay to $remote. Is the host online and reachable over SSH?"
     return
 }
 

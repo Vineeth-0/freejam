@@ -26,11 +26,11 @@ try {
     New-Item -ItemType Directory -Force -Path $output | Out-Null
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-    # Friend bundle: extension, friend guide, optional notifier.
+    # Friend bundle: extension, the full guide, optional notifier.
     $friend = Join-Path $stage "friend"
     New-Item -ItemType Directory -Force -Path (Join-Path $friend "notifier") | Out-Null
     Copy-RepoFile "freejam.js" $friend
-    Copy-RepoFile "INSTALL-FRIEND.txt" $friend
+    Copy-RepoFile "README.md" (Join-Path $friend "FreeJam-README.md")
     Copy-Item -Path (Join-Path $repoRoot "notifier\*") -Destination (Join-Path $friend "notifier") -Force
     Compress-Archive -Path (Join-Path $friend "*") -DestinationPath (Join-Path $output "FreeJam-Friend.zip") -Force
 
@@ -40,10 +40,6 @@ try {
     foreach ($file in @(
         "freejam.js",
         "freejam-relay.js",
-        "INSTALL.txt",
-        "INSTALL-FRIEND.txt",
-        "DEPLOY.md",
-        "PI-SETUP.md",
         "freejam-relay.service",
         "freejam-tunnel.service"
     )) {
@@ -71,18 +67,18 @@ try {
         "package.json",
         "Dockerfile",
         "render.yaml",
-        "DEPLOY.md",
-        "PI-SETUP.md",
         "freejam-relay.service",
         "freejam-tunnel.service"
     )) {
         Copy-RepoFile $file $relay
     }
+    Copy-RepoFile "README.md" (Join-Path $relay "FreeJam-README.md")
     Compress-Archive -Path (Join-Path $relay "*") -DestinationPath (Join-Path $output "FreeJam-relay-deploy.zip") -Force
 
     # Notifier-only bundle.
     $notifier = Join-Path $stage "notifier"
     New-Item -ItemType Directory -Force -Path (Join-Path $notifier "notifier") | Out-Null
+    Copy-RepoFile "README.md" (Join-Path $notifier "FreeJam-README.md")
     Copy-Item -Path (Join-Path $repoRoot "notifier\*") -Destination (Join-Path $notifier "notifier") -Force
     Compress-Archive -Path (Join-Path $notifier "*") -DestinationPath (Join-Path $output "FreeJam-Notifier.zip") -Force
 

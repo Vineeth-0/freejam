@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/freejam
-ExecStart=/usr/bin/node /home/pi/freejam/freejam-relay.js
+User=freejam
+WorkingDirectory=/home/freejam/freejam
+ExecStart=/usr/bin/node /home/freejam/freejam/freejam-relay.js
 Environment=PORT=8787
 Environment=HOST=127.0.0.1
 Restart=always
