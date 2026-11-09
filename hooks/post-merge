@@ -2,8 +2,7 @@
 # Post-merge hook: keep the live extension and the relay in sync after `git pull`.
 #
 # - freejam.js changed      -> copy into Spicetify and re-apply it.
-# - freejam-relay.js changed -> copy to the Pi and restart the service, if
-#                               FREEJAM_PI_HOST is configured.
+# - freejam-relay.js changed -> just a reminder: the relay is self-hosted, so restart your own.
 #
 # Set FREEJAM_DRY_RUN=1 to preview the actions, or FREEJAM_NO_RESTART=1 to
 # apply the extension without restarting Spotify.
@@ -47,6 +46,5 @@ if [ "$changed_js" -eq 1 ]; then
 fi
 
 if [ "$changed_relay" -eq 1 ]; then
-    powershell.exe -NoProfile -ExecutionPolicy Bypass \
-        -File "$repo_root/scripts/deploy-relay.ps1" $dry_run
+    echo "FreeJam: freejam-relay.js changed. Restart your own relay to use the new version."
 fi

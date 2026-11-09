@@ -48,7 +48,6 @@ player, not Spotify Jam.
 | `freejam-relay.js` | The dependency-free Node.js relay used by sync mode and friend mailboxes. |
 | `notifier/` | Optional background notifier for native alerts while Spotify is fully closed. |
 | `scripts/sync-to-spicetify.ps1` | Copies the extension into Spicetify and applies it. |
-| `scripts/deploy-relay.ps1` | Copies the relay to a remote host and restarts its service. |
 | `scripts/install-git-hooks.ps1` | Installs the `post-merge` and `pre-push` hooks. |
 | `scripts/build-bundles.ps1` | Rebuilds the release zip files into `dist/`. |
 | `hooks/post-merge` | After `git pull`, updates the extension and optionally deploys the relay. |
@@ -56,7 +55,7 @@ player, not Spotify Jam.
 | `README.md` | This file: install, usage, deployment and the full relay guide. |
 | `freejam-relay.service` | systemd unit for the relay. |
 | `freejam-tunnel.service` | systemd unit for a Cloudflare quick tunnel. |
-| `Dockerfile`, `render.yaml` | Container and Render deployment helpers. |
+| `Dockerfile` | Container image for a relay you run yourself. |
 
 ---
 
@@ -120,7 +119,7 @@ What the hooks do:
 
 | Hook | When | Action |
 | --- | --- | --- |
-| `post-merge` | After `git pull` | Copies `freejam.js` into Spicetify and runs `spicetify apply` if it changed. Also deploys `freejam-relay.js` to the configured Pi if it changed. |
+| `post-merge` | After `git pull` | Copies `freejam.js` into Spicetify and runs `spicetify apply` if it changed. If `freejam-relay.js` changed it only reminds you to restart your own relay. |
 | `pre-push` | Before `git push` | Applies the extension if `freejam.js` changed, so the local build matches what you push. |
 
 `spicetify apply` restarts Spotify so the new version loads immediately. To
@@ -138,34 +137,6 @@ $env:FREEJAM_DRY_RUN = "1"
 git pull
 ```
 
-### Automatic relay deployment
-
-If `freejam-relay.js` changes, the `post-merge` hook can copy it to a remote
-host and restart the service. Configure the target once:
-
-```powershell
-$env:FREEJAM_PI_HOST = "relay.example.com"   # required: your relay host or IP
-$env:FREEJAM_PI_USER = "freejam"             # optional: SSH user, default freejam
-$env:FREEJAM_PI_DIR = "~/freejam"            # optional
-$env:FREEJAM_PI_SERVICE = "freejam-relay"    # optional
-git pull
-```
-
-Or run the deploy script directly:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\deploy-relay.ps1 -PiHost relay.example.com
-```
-
-If the host is offline, the script prints a warning and does not block the pull.
-Without `FREEJAM_PI_HOST`, relay changes are skipped. The manual fallback is:
-
-```bash
-scp freejam-relay.js <user>@<host>:~/freejam/
-ssh <user>@<host> "sudo systemctl restart freejam-relay"
-```
-
----
 
 ## Request mode (no guest install)
 
@@ -582,7 +553,7 @@ A request-mode jam uses `"mode": "request"`, an `inviteUrl`, and an
 
 ## 6. Pick a hosting model
 
-Choose based on who needs to reach the relay.
+FreeJam is **self-hosted only**: there is no shared or default relay, and nobody else's server is ever used for you. Whoever starts a session runs their own relay; the join code carries its address. Choose based on who needs to reach it.
 
 | Situation | Recommended setup | URL to use in FreeJam |
 | --- | --- | --- |
@@ -590,9 +561,8 @@ Choose based on who needs to reach the relay.
 | Everyone on a Tailscale/private VPN | Run the relay on any always-on device | `ws://100.x.x.x:8787` |
 | Different networks, no server, temporary | Cloudflare Quick Tunnel in front of a local relay | `wss://<random>.trycloudflare.com` |
 | Different networks, stable, own domain | Named Cloudflare Tunnel | `wss://relay.example.com` |
-| Different networks, no server, free | Render web service | `wss://<name>.onrender.com` |
 | You already have a VPS | Relay behind Caddy or nginx | `wss://relay.example.com` |
-| Always-on home device | Raspberry Pi + systemd + tunnel | `wss://relay.example.com` or a quick tunnel |
+| Always-on machine you own | Relay as a service (systemd / Task Scheduler) + tunnel | `wss://relay.example.com` or a quick tunnel |
 
 **TLS rule:** anything that leaves your machine must use `wss://`. A bare
 `ws://` relay on the public internet exposes playback messages and keys to
@@ -647,7 +617,7 @@ winget install --id Cloudflare.cloudflared
 # macOS
 brew install cloudflared
 
-# Debian/Ubuntu/Raspberry Pi (ARM64)
+# Debian/Ubuntu (ARM64)
 wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64.deb
 sudo dpkg -i cloudflared-linux-arm64.deb
 ```
@@ -702,22 +672,7 @@ Then run `cloudflared tunnel run freejam` as a service. The included
 `/usr/bin/cloudflared tunnel run freejam` and set `User` to the account that owns
 the tunnel. Use `wss://relay.example.com` in FreeJam.
 
-### 6.5 Render
-
-The repo includes `package.json` and `render.yaml`. Create a Render **Web
-Service** from the repo:
-
-- Runtime: Node
-- Build: `npm install`
-- Start: `npm start`
-- Health check: `/health`
-- Plan: Free
-
-Use `wss://<name>.onrender.com`. Free services sleep after inactivity; the first
-connection can take 30–60 seconds, and FreeJam retries automatically. An open
-WebSocket keeps the service awake during a session.
-
-### 6.6 VPS with Caddy or nginx
+### 6.5 VPS with Caddy or nginx
 
 Run the relay on `127.0.0.1:8787` and terminate TLS in front of it.
 
@@ -756,7 +711,7 @@ server {
 The `Upgrade` and `Connection` headers are required. Without them the WebSocket
 handshake fails even though `/health` works.
 
-### 6.7 Docker
+### 6.6 Docker
 
 ```bash
 docker build -t freejam-relay .
@@ -812,13 +767,12 @@ You should see `FreeJam relay is running.`
 
 ### 7.2 Keep it running
 
-#### Linux / Raspberry Pi (systemd)
+#### Linux (systemd)
 
 The included `freejam-relay.service` assumes the relay is in
 `/home/freejam/freejam` (the `freejam` user's home), Node is at `/usr/bin/node`,
 and the service runs as `freejam`. Create that user, or edit those values to
-match your host. The deploy script copies to `~/freejam` by default, which
-matches this layout.
+match your host.
 
 ```bash
 sudo cp freejam-relay.service /etc/systemd/system/freejam-relay.service
@@ -856,7 +810,7 @@ pm2 startup
 
 #### Docker
 
-See [6.7 Docker](#67-docker). Use `--restart unless-stopped`.
+See [6.6 Docker](#66-docker). Use `--restart unless-stopped`.
 
 ### 7.3 Put TLS in front
 
@@ -866,7 +820,6 @@ Pick one:
 - **Named Cloudflare Tunnel** — stable URL, needs a domain.
 - **Caddy** — automatic certificates on a VPS.
 - **nginx** — manual certificate setup.
-- **Render** — TLS handled by the platform.
 
 Whichever you choose, the final URL must start with `wss://` when used over the
 internet.
@@ -985,18 +938,14 @@ uptime monitor at `/health` if you want to know when the relay is down.
 Update the relay whenever `freejam-relay.js` changes. Old relays reject friend
 mailboxes and show a handshake error in the extension.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\deploy-relay.ps1 -PiHost <host>
-```
-
-or manually:
+Copy the new file to your own relay machine and restart the service:
 
 ```bash
 scp freejam-relay.js user@host:~/freejam/
 ssh user@host "sudo systemctl restart freejam-relay"
 ```
 
-The `post-merge` hook does this automatically when `FREEJAM_PI_HOST` is set.
+FreeJam never deploys the relay for you: you run it, so you update it.
 
 ### Restart behavior
 
@@ -1011,7 +960,7 @@ add a database, but that is outside the current design.
 
 ### Resource use
 
-A Pi 5, a small VPS, or a spare PC is more than enough. The relay uses a few MB
+A small VPS or a spare PC is more than enough. The relay uses a few MB
 of RAM and almost no CPU. Memory grows with the number of live rooms, mailboxes
 and pending jams, all of which are capped (see [5.6 Limits](#56-limits)).
 
@@ -1091,14 +1040,13 @@ in the same public message.
 | Friend stays offline | Different relays, or relay too old | Use the same URL on both sides; update `freejam-relay.js`. |
 | Friend alert never arrives | Codes not exchanged, or sender not in the list | Add each other's `FJF1` codes; use **Send to friends**. |
 | Offline alert lost | Relay restarted | Pending alerts are in memory; ask the host to resend. |
-| Render takes ~1 minute | Free service was asleep | Wait; FreeJam retries with backoff. |
 
 ## 12. Example: an always-on home relay
 
 This is the layout many people use for a small friend group. Nothing here is
 required, and every value is a placeholder you replace with your own.
 
-- An always-on machine (a Raspberry Pi, mini PC, or spare laptop) on your
+- An always-on machine (a mini PC or spare laptop) on your
   network. Call it `<relay-host>`.
 - The relay runs as a systemd service (or Windows service) bound to
   `127.0.0.1:8787`.
@@ -1107,8 +1055,6 @@ required, and every value is a placeholder you replace with your own.
 - A private VPN such as Tailscale is optional and only for administration and
   deployment, never for guests.
 - The relay directory is `~/freejam` on that machine.
-- On the machine where you run `git pull`, automatic deploys use
-  `FREEJAM_PI_HOST=<relay-host>`.
 
 Useful commands on the relay machine:
 
