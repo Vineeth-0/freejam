@@ -105,7 +105,7 @@ Install them once:
 
 ```powershell
 cd C:\path\to\freejam
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-git-hooks.ps1
+powershell -NoProfile -ExecutionPolicy RemoteSigned -File .\scripts\install-git-hooks.ps1
 ```
 
 After that, updating is just:
@@ -1148,7 +1148,7 @@ Requirements:
    Windows (PowerShell in the `notifier` folder):
 
    ```powershell
-   powershell -ExecutionPolicy Bypass -File .\install-notifier.ps1
+   powershell -ExecutionPolicy RemoteSigned -File .\install-notifier.ps1
    ```
 
    macOS (Terminal in the `notifier` folder):
@@ -1197,7 +1197,7 @@ shows a **Join jam** card when it opens.
 Windows:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\uninstall-notifier.ps1
+powershell -ExecutionPolicy RemoteSigned -File .\uninstall-notifier.ps1
 ```
 
 macOS:
