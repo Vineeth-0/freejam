@@ -25,5 +25,5 @@ if [ "${FREEJAM_NO_RESTART:-0}" = "1" ]; then
     no_restart="-NoRestart"
 fi
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass \
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned \
     -File "$repo_root/scripts/sync-to-spicetify.ps1" $dry_run $no_restart

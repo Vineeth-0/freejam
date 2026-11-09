@@ -2560,21 +2560,13 @@
       .fj-root [hidden] {
         display: none !important;
       }
-      /* Keep the modal a modest size: opening a section scrolls inside it instead of growing to fill the screen. */
-      .GenericModal:has(.fj-root),
-      .main-embedded-modal-container:has(.fj-root) {
-        width: min(520px, 92vw) !important;
-        max-width: 520px !important;
-        height: auto !important;
-        max-height: min(82vh, 660px) !important;
-      }
+      /* The panel scrolls inside itself; Spotify's own modal frame is left alone. */
       .fj-root {
-        max-height: min(66vh, 560px);
+        max-height: min(70vh, 640px);
         overflow-y: auto;
         overscroll-behavior: contain;
       }
       .fj-section > summary { cursor: pointer; }
-      .fj-section-body { max-height: min(44vh, 360px); overflow-y: auto; overscroll-behavior: contain; }
       .fj-block {
         display: flex;
         flex-direction: column;

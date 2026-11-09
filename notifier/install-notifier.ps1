@@ -89,4 +89,4 @@ if ($NoStart) {
 }
 Write-Host "Config: $ConfigPath"
 Write-Host "Test it: node `"$target`" --test --config `"$ConfigPath`""
-Write-Host "Uninstall: powershell -ExecutionPolicy Bypass -File `"$installDir\uninstall-notifier.ps1`""
+Write-Host "Uninstall: powershell -ExecutionPolicy RemoteSigned -File `"$installDir\uninstall-notifier.ps1`""
