@@ -2562,9 +2562,13 @@
       }
       /* The panel scrolls inside itself; Spotify's own modal frame is left alone. */
       .fj-root {
-        max-height: min(70vh, 640px);
+        max-height: min(58vh, 500px);
         overflow-y: auto;
         overscroll-behavior: contain;
+      }
+      /* Without this the flex column squeezes its sections instead of scrolling. */
+      .fj-root > * {
+        flex-shrink: 0;
       }
       .fj-section > summary { cursor: pointer; }
       .fj-block {
