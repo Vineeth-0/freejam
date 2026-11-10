@@ -8,8 +8,10 @@
  * to everyone. Skips, seeks, play/pause from any participant are forwarded
  * to the host and then re-broadcast, so everyone stays together.
  *
- * Friends connect through the relay's mailboxes, so a jam invite only ever
- * reaches people you added.
+ * Friends use Spotify's own social graph: Listening Activity, following and
+ * followers, follow/unfollow, and profile links. Jam invites are shared as
+ * join codes. An optional self-hosted relay mailbox can deliver an invite
+ * automatically to people who already added you there.
  *
  * Sync mode is a cooperative third-party player, not Spotify Jam. Free
  * accounts never call Spotify's Premium-only Jam endpoints.
@@ -38,10 +40,15 @@
   const LAYOUT_STORAGE_KEY = "freejam:layout:v1";
   const FRIEND_CODE_PREFIX = "FJF1.";
   const NOTIFIER_CODE_PREFIX = "FJN1.";
+  // Public documentation. The panel only ever opens this one URL.
+  const README_URL =
+    "https://github.com/Vineeth-0/freejam/blob/HEAD/README.md";
   const FRIEND_PING_INTERVAL_MS = 15000;
   const FRIEND_RECONNECT_MAX_MS = 15000;
   const FRIEND_JAM_NOTIFY_COOLDOWN_MS = 45 * 1000;
   const MAX_FRIENDS = 200;
+  const SOCIAL_REFRESH_MS = 60 * 1000;
+  const SOCIAL_MAX_LIST = 200;
 
   // ---------------------------------------------------------------------------
   // State
@@ -80,6 +87,7 @@
   const ui = {
     button: null,
     root: null,
+    pane: "sync",
   };
 
   const sync = {
@@ -140,6 +148,34 @@
     lastNotifyAt: 0,
     handshaken: false,
     handshakeTimer: null,
+  };
+
+  // Native Spotify social state. This is the Friends feature; the relay above
+  // only powers optional automatic invites and sync transport.
+  const social = {
+    me: null,
+    mePromise: null,
+    activity: [],
+    following: [],
+    followers: [],
+    loading: {
+      activity: false,
+      following: false,
+      followers: false,
+    },
+    loadedAt: {
+      activity: 0,
+      following: 0,
+      followers: 0,
+    },
+    error: "",
+    tab: "activity",
+    followBusy: new Set(),
+    view: "list",
+    composeTarget: null,
+    relayOpen: false,
+    clipboardJam: null,
+    clipboardDismissed: "",
   };
 
   // ---------------------------------------------------------------------------
@@ -352,7 +388,9 @@
         sync.relayUrl = config.relayUrl;
         sync.sessionId = config.sessionId;
         sync.key = config.key;
-        sync.hostKey = config.hostKey || (config.role === "host" ? randomId(32) : "");
+        sync.hostKey =
+          config.hostKey ||
+          (config.role === "host" ? randomId(32) : "");
         sync.name = config.name || "";
         if (config.role === "host" && !config.hostKey) saveState();
       }
@@ -726,6 +764,372 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Spotify social graph
+  // ---------------------------------------------------------------------------
+
+  const SPCLIENT = "https://spclient.wg.spotify.com";
+  const WEB_API = "https://api.spotify.com/v1";
+
+  function usernameFromUri(uri) {
+    if (typeof uri !== "string") return "";
+    const match = uri.match(/^spotify:user:([^:]+)$/);
+    return match ? decodeURIComponent(match[1]) : "";
+  }
+
+  function normalizeProfile(entry) {
+    if (!entry || typeof entry !== "object") return null;
+
+    const username =
+      typeof entry.username === "string" && entry.username
+        ? entry.username
+        : usernameFromUri(entry.uri);
+    if (!username) return null;
+
+    return {
+      username,
+      name:
+        typeof entry.name === "string" && entry.name.trim()
+          ? entry.name.trim()
+          : username,
+      imageUrl:
+        typeof entry.image_url === "string"
+          ? entry.image_url
+          : typeof entry.imageUrl === "string"
+            ? entry.imageUrl
+            : "",
+      isFollowing:
+        entry.is_following !== undefined
+          ? Boolean(entry.is_following)
+          : Boolean(entry.isFollowing),
+      isFollowed: Boolean(entry.is_followed),
+    };
+  }
+
+  function socialCanRequest() {
+    return Boolean(
+      Spicetify.CosmosAsync &&
+        typeof Spicetify.CosmosAsync.get === "function"
+    );
+  }
+
+  // The desktop client stores its local keys under the signed-in username.
+  // Fallback only: some accounts get an auto-generated id here.
+  function signedInUsername() {
+    try {
+      const namespace =
+        Spicetify.Platform &&
+        Spicetify.Platform.LocalStorageAPI &&
+        Spicetify.Platform.LocalStorageAPI.namespace;
+      if (
+        typeof namespace === "string" &&
+        /^[A-Za-z0-9._-]{1,64}$/.test(namespace)
+      ) {
+        return namespace;
+      }
+    } catch {
+      /* ignore */
+    }
+    return "";
+  }
+
+  // Newer accounts have usernames that are random-looking ids, so showing one
+  // as an @handle above the display name adds nothing.
+  function looksGenerated(username) {
+    return /^[0-9a-z]{19,}$/i.test(username);
+  }
+
+  // The client's own profile endpoint returns the display name even when the
+  // Web API token cannot read it (/v1/me needs the user-read-private scope).
+  async function fetchClientProfile(username) {
+    if (!username || !socialCanRequest()) return null;
+    try {
+      const endpoint =
+        `${SPCLIENT}/user-profile-view/v3/profile/` +
+        encodeURIComponent(username);
+      const data = await Spicetify.CosmosAsync.get(endpoint);
+      if (!data || typeof data !== "object") return null;
+
+      const name =
+        (typeof data.name === "string" && data.name.trim()) ||
+        (typeof data.display_name === "string" && data.display_name.trim()) ||
+        "";
+      const imageUrl =
+        (typeof data.image_url === "string" && data.image_url) ||
+        (Array.isArray(data.images) && data.images[0] && data.images[0].url) ||
+        "";
+      if (!name && !imageUrl) return null;
+
+      return {
+        username:
+          (typeof data.username === "string" && data.username) || "",
+        name,
+        imageUrl,
+      };
+    } catch (err) {
+      console.warn("[FreeJam] Could not read the Spotify profile", err);
+      return null;
+    }
+  }
+
+  async function getMe(force = false) {
+    if (!force && social.me) return social.me;
+    if (!force && social.mePromise) return social.mePromise;
+
+    social.mePromise = (async () => {
+      let id = signedInUsername();
+      let webName = "";
+      let webImage = "";
+
+      if (socialCanRequest()) {
+        try {
+          const data = await Spicetify.CosmosAsync.get(`${WEB_API}/me`);
+          if (data && typeof data.id === "string" && data.id) {
+            id = data.id;
+            webName =
+              typeof data.display_name === "string"
+                ? data.display_name.trim()
+                : "";
+            webImage =
+              (Array.isArray(data.images) &&
+                data.images[0] &&
+                data.images[0].url) ||
+              "";
+          }
+        } catch (err) {
+          console.warn("[FreeJam] Could not read the Spotify profile", err);
+        }
+      }
+
+      if (!id) return null;
+
+      const profile = await fetchClientProfile(id);
+      const username = (profile && profile.username) || id;
+      const name = (profile && profile.name) || webName || username;
+
+      return {
+        username,
+        name,
+        imageUrl: (profile && profile.imageUrl) || webImage || "",
+        handle:
+          username !== name && !looksGenerated(username) ? username : "",
+      };
+    })();
+
+    try {
+      social.me = await social.mePromise;
+    } finally {
+      social.mePromise = null;
+    }
+    return social.me;
+  }
+
+  async function loadListeningActivity(force = false) {
+    if (social.loading.activity) return;
+    if (!force && Date.now() - social.loadedAt.activity < SOCIAL_REFRESH_MS) {
+      return;
+    }
+    if (!socialCanRequest()) {
+      social.error = "Spotify's social API is not available in this build.";
+      refreshFriendsPanel();
+      return;
+    }
+
+    social.loading.activity = true;
+    try {
+      const data = await Spicetify.CosmosAsync.get(
+        `${SPCLIENT}/presence-view/v1/buddylist`
+      );
+      const entries = data && Array.isArray(data.friends) ? data.friends : [];
+      const seen = new Set();
+
+      social.activity = entries
+        .map((entry) => {
+          const user = entry && entry.user;
+          const username = usernameFromUri(user && user.uri);
+          if (!username || seen.has(username)) return null;
+          seen.add(username);
+
+          const track = entry.track;
+          return {
+            username,
+            name: (user && user.name) || username,
+            imageUrl: (user && user.imageUrl) || "",
+            timestamp: Number(entry.timestamp) || 0,
+            track:
+              track && typeof track === "object"
+                ? {
+                    uri: track.uri || "",
+                    name: track.name || "",
+                    artist: (track.artist && track.artist.name) || "",
+                    album: (track.album && track.album.name) || "",
+                  }
+                : null,
+          };
+        })
+        .filter(Boolean)
+        .slice(0, SOCIAL_MAX_LIST);
+
+      social.loadedAt.activity = Date.now();
+      social.error = "";
+    } catch (err) {
+      console.warn("[FreeJam] Could not load Listening Activity", err);
+      social.error =
+        "Could not load Listening Activity. Turn it on in Spotify's Social settings, then refresh.";
+    } finally {
+      social.loading.activity = false;
+      refreshFriendsPanel();
+    }
+  }
+
+  async function loadSocialList(kind, force = false) {
+    if (kind !== "following" && kind !== "followers") return;
+    if (social.loading[kind]) return;
+    if (!force && Date.now() - social.loadedAt[kind] < SOCIAL_REFRESH_MS) {
+      return;
+    }
+    if (!socialCanRequest()) {
+      social.error = "Spotify's social API is not available in this build.";
+      refreshFriendsPanel();
+      return;
+    }
+
+    social.loading[kind] = true;
+    try {
+      const me = await getMe();
+      if (!me || !me.username) {
+        social.error = "Could not read your Spotify profile.";
+        return;
+      }
+
+      const data = await Spicetify.CosmosAsync.get(
+        `${SPCLIENT}/user-profile-view/v3/profile/${encodeURIComponent(
+          me.username
+        )}/${kind}`
+      );
+      const profiles = data && Array.isArray(data.profiles) ? data.profiles : [];
+      const seen = new Set();
+
+      social[kind] = profiles
+        .map(normalizeProfile)
+        .filter((profile) => {
+          if (!profile || seen.has(profile.username)) return false;
+          seen.add(profile.username);
+          return true;
+        })
+        .slice(0, SOCIAL_MAX_LIST);
+
+      social.loadedAt[kind] = Date.now();
+      social.error = "";
+    } catch (err) {
+      console.warn(`[FreeJam] Could not load ${kind}`, err);
+      social.error = `Could not load your ${kind} list.`;
+    } finally {
+      social.loading[kind] = false;
+      refreshFriendsPanel();
+    }
+  }
+
+  async function ensureSocialData(force = false) {
+    const me = await getMe(force);
+    if (!me) {
+      social.error =
+        "Could not read your Spotify profile. Open Spotify's profile page once, then refresh.";
+      refreshFriendsPanel();
+      return;
+    }
+
+    await loadListeningActivity(force);
+    if (social.tab === "following") await loadSocialList("following", force);
+    if (social.tab === "followers") await loadSocialList("followers", force);
+    refreshFriendsPanel();
+  }
+
+  async function setFollowing(profile, follow) {
+    const username = profile && profile.username;
+    if (!username || social.followBusy.has(username)) return;
+
+    social.followBusy.add(username);
+    refreshFriendsPanel();
+
+    try {
+      const definitions = Spicetify.GraphQL && Spicetify.GraphQL.Definitions;
+      const definition = definitions
+        ? definitions[follow ? "followUsers" : "unfollowUsers"]
+        : null;
+      if (!definition) throw new Error("Follow API unavailable");
+
+      await Spicetify.GraphQL.Request(definition, { usernames: [username] });
+
+      for (const list of [social.following, social.followers]) {
+        for (const item of list) {
+          if (item.username === username) item.isFollowing = follow;
+        }
+      }
+      if (!follow && social.tab === "following") {
+        social.following = social.following.filter(
+          (item) => item.username !== username
+        );
+      }
+
+      Spicetify.showNotification(
+        follow ? `Following ${profile.name}.` : `Unfollowed ${profile.name}.`
+      );
+    } catch (err) {
+      console.warn("[FreeJam] Could not change follow state", err);
+      Spicetify.showNotification(
+        `Could not ${follow ? "follow" : "unfollow"} ${profile.name}.`,
+        true
+      );
+    } finally {
+      social.followBusy.delete(username);
+      refreshFriendsPanel();
+    }
+  }
+
+  function hidePanel() {
+    try {
+      if (
+        Spicetify.PopupModal &&
+        typeof Spicetify.PopupModal.hide === "function"
+      ) {
+        Spicetify.PopupModal.hide();
+      }
+    } catch {
+      /* ignore */
+    }
+    ui.root = null;
+  }
+
+  function openProfile(username, subpage) {
+    if (!username) return;
+    const suffix =
+      subpage === "followers" || subpage === "following" ? `/${subpage}` : "";
+    try {
+      Spicetify.Platform.History.push(
+        `/user/${encodeURIComponent(username)}${suffix}`
+      );
+      hidePanel();
+    } catch (err) {
+      console.warn("[FreeJam] Could not open the Spotify profile", err);
+      Spicetify.showNotification("Could not open that Spotify profile.", true);
+    }
+  }
+
+  function openPeopleSearch(query) {
+    const value = String(query || "").trim();
+    if (!value) return;
+    try {
+      Spicetify.Platform.History.push(
+        `/search/${encodeURIComponent(value)}/users`
+      );
+      hidePanel();
+    } catch (err) {
+      console.warn("[FreeJam] Could not open Spotify search", err);
+      Spicetify.showNotification("Could not open Spotify search.", true);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Sync mode: transport
   // ---------------------------------------------------------------------------
 
@@ -752,7 +1156,9 @@
       url = new URL(sync.relayUrl);
       url.searchParams.set("session", sync.sessionId);
       url.searchParams.set("key", sync.key);
-      if (sync.role === "host") url.searchParams.set("hostKey", sync.hostKey);
+      if (sync.role === "host") {
+        url.searchParams.set("hostKey", sync.hostKey);
+      }
       url.searchParams.set("id", sync.selfId);
       url.searchParams.set(
         "name",
@@ -1845,22 +2251,19 @@
     }
   }
 
-  function joinIncomingJam() {
-    const jam = friends.incomingJam;
-    if (!jam || jam.mode !== "sync") return;
-
+  function joinSyncFromCode(joinCode, fromName) {
     if (sync.role === "host") {
       Spicetify.showNotification(
         "Leave your own sync session before joining a friend's.",
         true
       );
-      return;
+      return false;
     }
 
-    const config = decodeJoinCode(jam.joinCode);
+    const config = decodeJoinCode(joinCode);
     if (!config) {
       Spicetify.showNotification("This jam invite is invalid or expired.", true);
-      return;
+      return false;
     }
 
     sync.role = "guest";
@@ -1874,8 +2277,63 @@
     saveState();
     connectSync();
     refreshPanelSections();
-    Spicetify.showNotification(`Joining ${jam.fromName || "your friend"}'s sync.`);
-    clearIncomingJam();
+    Spicetify.showNotification(
+      fromName ? `Joining ${fromName}'s sync.` : "Joining the sync session."
+    );
+    return true;
+  }
+
+  function joinIncomingJam() {
+    const jam = friends.incomingJam;
+    if (!jam || jam.mode !== "sync") return;
+    if (joinSyncFromCode(jam.joinCode, jam.fromName)) {
+      clearIncomingJam();
+    }
+  }
+
+  function detectClipboardInvite() {
+    const clipboard = navigator.clipboard;
+    if (!clipboard || typeof clipboard.readText !== "function") return;
+    if (sync.role) return;
+
+    clipboard
+      .readText()
+      .then((text) => {
+        const config = decodeJoinCode(text);
+        if (!config || sync.role) return;
+        if (social.clipboardDismissed === text) return;
+        social.clipboardJam = { code: text, config, at: Date.now() };
+        refreshPanelSections();
+      })
+      .catch(() => {});
+  }
+
+  function joinClipboardJam() {
+    const jam = social.clipboardJam;
+    if (!jam) return;
+    if (joinSyncFromCode(jam.code, "")) {
+      social.clipboardJam = null;
+      refreshPanelSections();
+    }
+  }
+
+  function buildJamInviteText(profile) {
+    const jam = buildLocalJam();
+    if (!jam) return "";
+    const host = friendIdentityName();
+    const lines = [];
+    lines.push(
+      profile && profile.name
+        ? `${host} invited you to a FreeJam playback sync.`
+        : `Join ${host}'s FreeJam playback sync.`
+    );
+    lines.push("");
+    lines.push(jam.joinCode);
+    lines.push("");
+    lines.push(
+      "Open FreeJam in Spotify, paste the code under Join a sync session, then press Join sync."
+    );
+    return lines.join("\n");
   }
 
   function friendInviteMessage() {
@@ -1908,18 +2366,43 @@
     style.className = "freejam-styles";
     style.textContent = `
       .fj-root {
-        --fj-accent: var(--spice-button, #1db954);
+        --fj-fg: #ffffff;
+        --fj-muted: #a7a7a7;
+        --fj-accent: var(--spice-button, #1ed760);
+        --fj-accent-active: var(--spice-button-active, var(--fj-accent));
+        --fj-on-accent: var(--spice-button-text, #000000);
+        --fj-error: #f15e6c;
+        --fj-warn: #f6c358;
+        --fj-panel: #0f0f0f;
+        --fj-card: #1c1c1c;
+        --fj-input: #242424;
+        --fj-hover: #2a2a2a;
+        --fj-line: #2f2f2f;
+        --fj-line-strong: #414141;
         --fj-accent-soft: rgba(29, 185, 84, 0.16);
-        --fj-border: rgba(255, 255, 255, 0.09);
-        --fj-border-strong: rgba(255, 255, 255, 0.18);
-        --fj-radius: 14px;
+        --fj-accent-soft: color-mix(in srgb, var(--fj-accent) 18%, transparent);
+        --fj-accent-line: rgba(29, 185, 84, 0.4);
+        --fj-accent-line: color-mix(in srgb, var(--fj-accent) 45%, transparent);
+        --fj-radius: 16px;
         display: flex;
         flex-direction: column;
-        gap: 12px;
-        padding: 0 22px 24px;
-        color: var(--spice-text, #fff);
+        gap: 14px;
+        padding: 20px 24px 24px;
+        border-radius: var(--fj-radius);
+        background: var(--fj-panel);
+        max-height: min(78vh, 860px);
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        scrollbar-width: thin;
+        scrollbar-color: var(--fj-line-strong) transparent;
+        color: var(--fj-fg);
         font-size: 14px;
         line-height: 1.45;
+      }
+      /* Keep Spicetify's popup frame black behind the panel. Selector is inert
+         when the modal class is not present in this Spotify build. */
+      .GenericModal:has(.fj-root) {
+        background-color: #0f0f0f;
       }
       .fj-root *,
       .fj-root *::before,
@@ -1929,215 +2412,199 @@
       .fj-root [hidden] {
         display: none !important;
       }
-      /* The panel scrolls inside itself; Spotify's own modal frame is left alone. */
-      .fj-root {
-        max-height: min(58vh, 500px);
-        overflow-y: auto;
-        overscroll-behavior: contain;
-      }
       /* Without this the flex column squeezes its sections instead of scrolling. */
       .fj-root > * {
         flex-shrink: 0;
       }
-      .fj-section > summary { cursor: pointer; }
+      .fj-root::-webkit-scrollbar {
+        width: 10px;
+      }
+      .fj-root::-webkit-scrollbar-thumb {
+        border: 3px solid transparent;
+        border-radius: 999px;
+        background: var(--fj-line-strong);
+        background-clip: content-box;
+      }
+
+      /* ---- Status bar ------------------------------------------------------ */
+      .fj-hero {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 13px 16px;
+        border: 1px solid var(--fj-line);
+        border-radius: 12px;
+        background: var(--fj-card);
+        font-size: 13px;
+        line-height: 1.4;
+      }
+      .fj-hero-text {
+        min-width: 0;
+      }
+
+      /* ---- Tabs ------------------------------------------------------------ */
+      .fj-tabs {
+        display: flex;
+        gap: 4px;
+        padding: 4px;
+        border: 1px solid var(--fj-line);
+        border-radius: 999px;
+        background: var(--fj-card);
+      }
+      .fj-tab {
+        flex: 1 1 0;
+        min-width: 0;
+        padding: 9px 12px;
+        border: 0;
+        border-radius: 999px;
+        background: transparent;
+        color: var(--fj-muted);
+        font: inherit;
+        font-size: 13px;
+        font-weight: 700;
+        cursor: pointer;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        transition: background 0.15s ease, color 0.15s ease;
+      }
+      .fj-tab:hover {
+        color: var(--fj-fg);
+        background: var(--fj-hover);
+      }
+      .fj-tab.active {
+        color: var(--fj-on-accent);
+        background: var(--fj-accent);
+      }
+      .fj-tab:focus-visible {
+        outline: 2px solid var(--fj-accent);
+        outline-offset: 2px;
+      }
+
+      /* ---- Panes ----------------------------------------------------------- */
+      .fj-pane {
+        display: none;
+      }
+      .fj-pane.is-active {
+        display: block;
+        animation: fj-fade 0.18s ease;
+      }
+      @keyframes fj-fade {
+        from {
+          opacity: 0;
+          transform: translateY(2px);
+        }
+        to {
+          opacity: 1;
+          transform: none;
+        }
+      }
+      .fj-section-body {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
       .fj-block {
         display: flex;
         flex-direction: column;
         gap: 12px;
       }
-      .fj-section {
-        border: 1px solid var(--fj-border);
-        border-radius: var(--fj-radius);
-        background: linear-gradient(
-          180deg,
-          rgba(255, 255, 255, 0.045),
-          rgba(255, 255, 255, 0.015)
-        );
-        overflow: hidden;
-        transition: border-color 0.15s ease;
-      }
-      .fj-section:hover {
-        border-color: var(--fj-border-strong);
-      }
-      .fj-section > summary {
-        position: relative;
-        display: flex;
-        align-items: baseline;
-        gap: 8px;
-        padding: 13px 44px 13px 16px;
-        cursor: pointer;
-        font-weight: 700;
-        font-size: 13px;
-        list-style: none;
-        user-select: none;
-      }
-      .fj-section > summary:focus-visible,
-      .fj-input:focus-visible {
-        outline: 3px solid #7fc8ff;
-        outline-offset: 2px;
-      }
-      .fj-section > summary::-webkit-details-marker {
-        display: none;
-      }
-      .fj-section > summary::after {
-        content: "";
-        position: absolute;
-        top: 50%;
-        right: 18px;
-        width: 8px;
-        height: 8px;
-        margin-top: -6px;
-        border-right: 2px solid var(--spice-subtext, #b3b3b3);
-        border-bottom: 2px solid var(--spice-subtext, #b3b3b3);
-        transform: rotate(45deg);
-        transition: transform 0.15s ease, margin-top 0.15s ease;
-      }
-      .fj-section[open] > summary::after {
-        margin-top: -2px;
-        transform: rotate(-135deg);
-      }
-      .fj-section-label {
-        color: var(--spice-text, #fff);
-      }
-      .fj-section-sub {
-        color: var(--spice-subtext, #b3b3b3);
-        font-size: 11px;
-        font-weight: 500;
-      }
-      .fj-section-body {
-        display: flex;
-        flex-direction: column;
-        gap: 12px;
-        padding: 0 14px 14px;
-      }
-      .fj-status {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        padding: 11px 13px;
-        border-radius: 10px;
-        background: rgba(255, 255, 255, 0.055);
-        font-size: 13px;
-      }
-      .fj-root > .fj-status {
-        padding: 14px 16px;
-        border: 1px solid var(--fj-border);
-        border-radius: var(--fj-radius);
-        background:
-          radial-gradient(
-            130% 180% at 0% 0%,
-            rgba(29, 185, 84, 0.2),
-            transparent 62%
-          ),
-          linear-gradient(
-            135deg,
-            rgba(255, 255, 255, 0.07),
-            rgba(255, 255, 255, 0.015)
-          );
-        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
-      }
-      .fj-dot {
-        width: 8px;
-        height: 8px;
-        flex: 0 0 auto;
-        border-radius: 50%;
-        background: var(--fj-accent, #1db954);
-        box-shadow: 0 0 0 4px rgba(29, 185, 84, 0.18);
-      }
-      .fj-dot.off {
-        background: #888;
-        box-shadow: none;
-      }
+
+      /* ---- Cards ----------------------------------------------------------- */
       .fj-card {
         display: flex;
         flex-direction: column;
-        gap: 12px;
-        padding: 16px;
-        border: 1px solid var(--fj-border);
-        border-radius: 12px;
-        background: linear-gradient(
-          180deg,
-          rgba(255, 255, 255, 0.045),
-          rgba(255, 255, 255, 0.015)
-        );
+        gap: 14px;
+        padding: 18px 20px;
+        border: 1px solid var(--fj-line);
+        border-radius: var(--fj-radius);
+        background: var(--fj-card);
       }
       .fj-card-head {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 10px;
+        min-height: 24px;
       }
       .fj-card-title {
+        font-size: 18px;
         font-weight: 700;
-        font-size: 14px;
-        letter-spacing: 0.01em;
+        letter-spacing: -0.01em;
+        line-height: 1.3;
       }
       .fj-subtitle {
+        color: var(--fj-muted);
+        font-size: 11.5px;
         font-weight: 700;
-        font-size: 12px;
-        letter-spacing: 0.02em;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
       }
       .fj-badge {
-        padding: 3px 10px;
-        border: 1px solid rgba(29, 185, 84, 0.24);
+        flex: 0 0 auto;
+        padding: 4px 10px;
+        border: 1px solid var(--fj-accent-line);
         border-radius: 999px;
+        background: var(--fj-accent-soft);
+        color: var(--fj-fg);
         font-size: 10px;
         font-weight: 800;
-        letter-spacing: 0.06em;
+        letter-spacing: 0.08em;
         text-transform: uppercase;
-        background: var(--fj-accent-soft, rgba(29, 185, 84, 0.16));
-        color: #1ed760;
         white-space: nowrap;
       }
       .fj-badge.off {
-        border-color: var(--fj-border);
-        background: rgba(255, 255, 255, 0.08);
-        color: var(--spice-subtext, #b3b3b3);
+        border-color: var(--fj-line);
+        background: transparent;
+        color: var(--fj-muted);
       }
       .fj-row {
         display: flex;
+        flex-wrap: wrap;
         align-items: center;
-        gap: 8px;
+        gap: 10px;
       }
       .fj-actions {
         display: flex;
         flex-wrap: wrap;
-        gap: 8px;
-        padding-top: 2px;
+        align-items: center;
+        gap: 10px;
       }
       .fj-divider {
         height: 1px;
         margin: 2px 0;
-        background: rgba(255, 255, 255, 0.08);
+        background: var(--fj-line);
       }
+
+      /* ---- Inputs and buttons ---------------------------------------------- */
       .fj-input {
-        flex: 1 1 auto;
+        flex: 1 1 200px;
         min-width: 0;
-        padding: 10px 12px;
-        border: 1px solid var(--fj-border);
+        padding: 11px 14px;
+        border: 1px solid var(--fj-line);
         border-radius: 10px;
         outline: none;
-        color: inherit;
-        background: rgba(0, 0, 0, 0.2);
+        color: var(--fj-fg);
+        background: var(--fj-input);
         font: inherit;
         font-size: 13px;
         transition: border-color 0.15s ease, box-shadow 0.15s ease,
           background 0.15s ease;
       }
       .fj-input::placeholder {
-        color: var(--spice-subtext, #b3b3b3);
+        color: var(--fj-muted);
         opacity: 0.8;
       }
       .fj-input:hover {
-        border-color: var(--fj-border-strong);
+        border-color: var(--fj-line-strong);
       }
       .fj-input:focus {
-        border-color: var(--fj-accent, #1db954);
-        background: rgba(0, 0, 0, 0.26);
-        box-shadow: 0 0 0 3px var(--fj-accent-soft, rgba(29, 185, 84, 0.16));
+        border-color: var(--fj-accent);
+        background: var(--fj-hover);
+        box-shadow: 0 0 0 3px var(--fj-accent-soft);
       }
       .fj-name {
-        flex: 0 1 140px;
+        flex: 0 1 150px;
       }
       .fj-mono {
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -2149,183 +2616,142 @@
         justify-content: center;
         gap: 6px;
         flex: 0 0 auto;
-        padding: 9px 16px;
+        padding: 11px 20px;
         border: 0;
         border-radius: 999px;
         cursor: pointer;
         font: inherit;
-        font-size: 13px;
+        font-size: 13.5px;
         font-weight: 700;
-        background: var(--fj-accent, #1db954);
-        color: var(--spice-button-text, #000);
-        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
-        transition: transform 0.1s ease, filter 0.15s ease,
-          box-shadow 0.15s ease;
+        letter-spacing: 0.01em;
+        background: var(--fj-accent);
+        color: var(--fj-on-accent);
+        transition: background 0.15s ease, box-shadow 0.15s ease,
+          transform 0.1s ease, color 0.15s ease;
       }
       .fj-btn:hover {
-        filter: brightness(1.08);
+        background: var(--fj-accent-active);
       }
       .fj-btn:active {
         transform: scale(0.97);
       }
+      .fj-btn:focus-visible {
+        outline: 2px solid var(--fj-accent);
+        outline-offset: 2px;
+      }
+      .fj-btn:disabled {
+        opacity: 0.55;
+        cursor: default;
+      }
+      .fj-btn.secondary {
+        background: var(--fj-input);
+        color: var(--fj-fg);
+        box-shadow: inset 0 0 0 1px var(--fj-line-strong);
+      }
+      .fj-btn.secondary:hover {
+        background: var(--fj-hover);
+      }
+      .fj-btn.danger {
+        background: transparent;
+        color: var(--fj-error);
+        box-shadow: inset 0 0 0 1px rgba(241, 94, 108, 0.45);
+      }
+      .fj-btn.danger:hover {
+        background: rgba(241, 94, 108, 0.12);
+      }
+      .fj-btn.ghost {
+        background: transparent;
+        color: var(--fj-muted);
+        box-shadow: none;
+      }
+      .fj-btn.ghost:hover {
+        color: var(--fj-fg);
+        background: var(--fj-hover);
+      }
+      .fj-btn.small {
+        padding: 7px 14px;
+        font-size: 12px;
+      }
       @media (prefers-reduced-motion: reduce) {
-        .fj-btn {
+        .fj-btn,
+        .fj-pane.is-active {
           transition: none;
+          animation: none;
         }
         .fj-btn:active {
           transform: none;
         }
       }
-      .fj-btn:focus-visible {
-        outline: 2px solid var(--fj-accent, #1db954);
-        outline-offset: 2px;
-      }
-      .fj-btn.secondary {
-        background: rgba(255, 255, 255, 0.06);
-        color: var(--spice-text, #fff);
-        box-shadow: inset 0 0 0 1px var(--fj-border-strong);
-      }
-      .fj-btn.secondary:hover {
-        background: rgba(255, 255, 255, 0.11);
-      }
-      .fj-btn.danger {
-        background: transparent;
-        color: #f15e6c;
-        box-shadow: inset 0 0 0 1px rgba(241, 94, 108, 0.45);
-      }
-      .fj-btn.ghost {
-        background: transparent;
-        color: var(--spice-subtext, #b3b3b3);
-        box-shadow: none;
-      }
-      .fj-btn.ghost:hover {
-        color: var(--spice-text, #fff);
-      }
-      .fj-btn.small {
-        padding: 5px 11px;
-        font-size: 11px;
-      }
+
+      /* ---- Text ------------------------------------------------------------ */
       .fj-hint,
       .fj-muted {
-        color: var(--spice-subtext, #b3b3b3);
+        color: var(--fj-muted);
+        font-size: 12.5px;
+        line-height: 1.6;
+      }
+      .fj-root > .fj-hint {
+        padding: 0 2px;
         font-size: 12px;
-        line-height: 1.5;
-      }
-      .fj-setting {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 14px;
-        padding: 12px 0;
-      }
-      .fj-setting + .fj-setting {
-        border-top: 1px solid rgba(255, 255, 255, 0.06);
-      }
-      .fj-setting-text {
-        min-width: 0;
-      }
-      .fj-setting-title {
-        font-weight: 600;
-        font-size: 13px;
-      }
-      .fj-setting-desc {
-        margin-top: 2px;
-        color: var(--spice-subtext, #b3b3b3);
-        font-size: 12px;
-        line-height: 1.4;
-      }
-      .fj-switch {
-        position: relative;
-        flex: 0 0 auto;
-        width: 40px;
-        height: 22px;
-        padding: 0;
-        border: 0;
-        border-radius: 999px;
-        background: rgba(255, 255, 255, 0.18);
-        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
-        cursor: pointer;
-        transition: background 0.15s ease, box-shadow 0.15s ease;
-      }
-      .fj-switch::after {
-        content: "";
-        position: absolute;
-        top: 3px;
-        left: 3px;
-        width: 16px;
-        height: 16px;
-        border-radius: 50%;
-        background: #fff;
-        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
-        transition: transform 0.15s ease;
-      }
-      .fj-switch:hover {
-        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.24);
-      }
-      .fj-switch[aria-checked="true"] {
-        background: var(--fj-accent, #1db954);
-        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12);
-      }
-      .fj-switch[aria-checked="true"]::after {
-        transform: translateX(18px);
-      }
-      .fj-switch:disabled {
-        opacity: 0.45;
-        cursor: default;
-      }
-      .fj-switch:focus-visible {
-        outline: 2px solid var(--fj-accent, #1db954);
-        outline-offset: 2px;
       }
       .fj-warn {
-        color: #f6c358;
-        font-size: 12px;
+        color: var(--fj-warn);
+        font-size: 12.5px;
         line-height: 1.5;
+      }
+      .fj-empty,
+      .fj-social-empty {
+        padding: 10px 2px;
+        color: var(--fj-muted);
+        font-size: 12.5px;
+        line-height: 1.55;
+      }
+      .fj-social-empty {
+        padding: 16px 2px;
+      }
+
+      /* ---- Status ---------------------------------------------------------- */
+      .fj-status {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 11px 13px;
+        border-radius: 10px;
+        background: var(--fj-input);
+        font-size: 12.5px;
+      }
+      .fj-dot {
+        width: 8px;
+        height: 8px;
+        flex: 0 0 auto;
+        border-radius: 50%;
+        background: var(--fj-accent);
+        box-shadow: 0 0 0 3px var(--fj-accent-soft);
+      }
+      .fj-dot.off {
+        background: var(--fj-muted);
+        box-shadow: none;
+      }
+      .fj-sync-status {
+        color: var(--fj-muted);
+        font-size: 12.5px;
+      }
+      .fj-status.fj-jam {
+        flex-wrap: wrap;
+        background: var(--fj-accent-soft);
       }
       .fj-now {
         display: flex;
-        gap: 6px;
         flex-wrap: wrap;
+        gap: 6px;
         font-size: 12px;
       }
       .fj-now-name {
-        color: var(--spice-text, #fff);
+        color: var(--fj-fg);
         font-weight: 600;
       }
-      .fj-list {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-      }
-      .fj-item {
-        display: flex;
-        gap: 12px;
-        align-items: center;
-        padding: 9px 8px;
-        margin: 0 -8px;
-        border-radius: 10px;
-        transition: background 0.12s ease;
-      }
-      .fj-item:hover {
-        background: rgba(255, 255, 255, 0.045);
-      }
-      .fj-item-info {
-        flex: 1 1 auto;
-        min-width: 0;
-      }
-      .fj-item-name {
-        font-weight: 600;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .fj-item-meta {
-        color: var(--spice-subtext, #b3b3b3);
-        font-size: 12px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
+
+      /* ---- Avatars and people ---------------------------------------------- */
       .fj-avatar {
         position: relative;
         display: inline-flex;
@@ -2335,49 +2761,326 @@
         width: 36px;
         height: 36px;
         border-radius: 50%;
-        color: #fff;
+        color: var(--fj-on-accent);
         font-size: 12px;
         font-weight: 800;
         letter-spacing: 0.02em;
-        background: linear-gradient(135deg, #2a6b45, #1db954);
-        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.15);
+        background: var(--fj-accent);
+        background: linear-gradient(
+          140deg,
+          color-mix(in srgb, var(--fj-accent) 82%, #ffffff),
+          var(--fj-accent)
+        );
       }
       .fj-avatar.off {
-        background: linear-gradient(135deg, #3a3a3a, #565656);
-        color: rgba(255, 255, 255, 0.75);
+        color: var(--fj-muted);
+        background: #333333;
+        box-shadow: inset 0 0 0 1px var(--fj-line);
+      }
+      .fj-avatar-img {
+        width: 100%;
+        height: 100%;
+        border-radius: 50%;
+        object-fit: cover;
+        display: block;
       }
       .fj-avatar .fj-dot {
         position: absolute;
         right: -1px;
         bottom: -1px;
+        z-index: 1;
         width: 10px;
         height: 10px;
-        border: 2px solid var(--spice-card, #121212);
-        box-shadow: none;
+        border-radius: 50%;
+        box-shadow: 0 0 0 2px var(--fj-card);
       }
       .fj-avatar .fj-dot.off {
-        background: #888;
+        background: var(--fj-muted);
       }
-      .fj-empty {
-        padding: 10px 0;
-        color: var(--spice-subtext, #b3b3b3);
+      .fj-list,
+      .fj-social-list {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      .fj-item {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 9px 10px;
+        margin: 0 -10px;
+        border-radius: 10px;
+        transition: background 0.12s ease;
+      }
+      .fj-item:hover {
+        background: var(--fj-hover);
+      }
+      .fj-item-info {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      .fj-item-name {
+        font-size: 13px;
+        font-weight: 600;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .fj-item-meta {
+        color: var(--fj-muted);
         font-size: 12px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
-      .fj-sync-status {
-        padding: 10px 12px;
-        border: 1px solid var(--fj-border);
-        background: rgba(0, 0, 0, 0.16);
+      .fj-item-actions {
+        display: flex;
+        flex: 0 0 auto;
+        align-items: center;
+        gap: 8px;
+        margin-left: auto;
+      }
+      .fj-item-track {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        min-width: 0;
+      }
+      .fj-item-track .fj-live {
+        color: var(--fj-accent);
+        font-size: 8px;
+      }
+      .fj-me {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 12px 14px;
+        border: 1px solid var(--fj-line);
+        border-radius: 12px;
+        background: var(--fj-input);
+      }
+      .fj-me-info {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      .fj-me-name {
+        font-weight: 700;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .fj-me-handle {
+        color: var(--fj-muted);
         font-size: 12px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
-      .fj-jam {
+
+      /* ---- Settings -------------------------------------------------------- */
+      .fj-setting {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 12px 0;
+      }
+      .fj-setting + .fj-setting {
+        border-top: 1px solid var(--fj-line);
+      }
+      .fj-setting-text {
+        min-width: 0;
+      }
+      .fj-setting-title {
+        font-size: 13px;
+        font-weight: 600;
+      }
+      .fj-setting-desc {
+        margin-top: 3px;
+        color: var(--fj-muted);
+        font-size: 11.5px;
+        line-height: 1.5;
+      }
+      .fj-switch {
+        position: relative;
+        flex: 0 0 auto;
+        width: 40px;
+        height: 22px;
+        padding: 0;
+        border: 0;
+        border-radius: 999px;
+        background: var(--fj-line-strong);
+        cursor: pointer;
+        transition: background 0.15s ease;
+      }
+      .fj-switch::after {
+        content: "";
+        position: absolute;
+        top: 3px;
+        left: 3px;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: #ffffff;
+        transition: transform 0.15s ease;
+      }
+      .fj-switch[aria-checked="true"] {
+        background: var(--fj-accent);
+      }
+      .fj-switch[aria-checked="true"]::after {
+        background: var(--fj-on-accent);
+        transform: translateX(18px);
+      }
+      .fj-switch:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+      .fj-switch:focus-visible {
+        outline: 2px solid var(--fj-accent);
+        outline-offset: 2px;
+      }
+
+      /* ---- Invites and codes ----------------------------------------------- */
+      .fj-clipboard {
+        border: 1px solid var(--fj-accent-line);
+      }
+      .fj-invite-hero {
+        position: relative;
+        overflow: hidden;
+        padding: 18px;
+        border: 1px solid var(--fj-accent-line);
+        border-radius: var(--fj-radius);
+        background:
+          radial-gradient(
+            130% 160% at 0% 0%,
+            var(--fj-accent-soft),
+            transparent 66%
+          ),
+          var(--fj-input);
+      }
+      .fj-invite-avatars {
+        display: flex;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+      .fj-invite-avatars .fj-avatar {
+        width: 46px;
+        height: 46px;
+        font-size: 14px;
+        box-shadow: 0 0 0 2px var(--fj-card);
+      }
+      .fj-invite-avatars .fj-avatar + .fj-avatar {
+        margin-left: -12px;
+      }
+      .fj-invite-kicker {
+        color: var(--fj-accent);
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+      .fj-invite-title {
+        margin-top: 4px;
+        font-size: 18px;
+        font-weight: 800;
+        line-height: 1.3;
+      }
+      .fj-invite-sub {
+        margin-top: 5px;
+        color: var(--fj-muted);
+        font-size: 12.5px;
+      }
+      .fj-code-card {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 9px 9px 9px 13px;
+        border: 1px dashed var(--fj-line-strong);
+        border-radius: 12px;
+        background: var(--fj-input);
+      }
+      .fj-code-card .fj-input {
+        padding: 0;
+        border: 0;
+        background: transparent;
+        font-size: 11.5px;
+      }
+      .fj-code-card .fj-input:focus {
+        box-shadow: none;
+      }
+
+      /* ---- Documentation links --------------------------------------------- */
+      .fj-docs {
+        display: flex;
         flex-wrap: wrap;
-        padding: 12px;
-        border: 1px solid rgba(29, 185, 84, 0.3);
-        background: linear-gradient(
-          135deg,
-          rgba(29, 185, 84, 0.18),
-          rgba(29, 185, 84, 0.05)
-        );
+        align-items: baseline;
+        gap: 4px 12px;
+        font-size: 12px;
+      }
+      .fj-docs-label {
+        color: var(--fj-muted);
+      }
+      .fj-link {
+        color: var(--fj-accent);
+        font-weight: 600;
+        text-decoration: none;
+        border-bottom: 1px solid transparent;
+      }
+      .fj-link::after {
+        content: " ↗";
+        font-size: 10px;
+        opacity: 0.75;
+      }
+      .fj-link:hover {
+        border-bottom-color: currentColor;
+      }
+      .fj-link:focus-visible {
+        outline: 2px solid var(--fj-accent);
+        outline-offset: 2px;
+      }
+
+      /* ---- Relay details --------------------------------------------------- */
+      .fj-relay-details {
+        margin-top: 2px;
+        padding-top: 14px;
+        border-top: 1px solid var(--fj-line);
+      }
+      .fj-relay-details > summary {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 2px 0;
+        color: var(--fj-fg);
+        font-size: 13px;
+        font-weight: 700;
+        list-style: none;
+        cursor: pointer;
+        user-select: none;
+      }
+      .fj-relay-details > summary::-webkit-details-marker {
+        display: none;
+      }
+      .fj-relay-details > summary::before {
+        content: "";
+        flex: 0 0 auto;
+        width: 6px;
+        height: 6px;
+        border-right: 2px solid var(--fj-muted);
+        border-bottom: 2px solid var(--fj-muted);
+        transform: rotate(-45deg);
+        transition: transform 0.15s ease;
+      }
+      .fj-relay-details[open] > summary::before {
+        transform: rotate(45deg);
+      }
+      .fj-relay-details > summary .fj-badge {
+        margin-left: auto;
+      }
+      .fj-relay-body {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        padding: 14px 0 2px;
       }
     `;
     document.head.appendChild(style);
@@ -2389,11 +3092,52 @@
     return button;
   }
 
+  function docLink(label, anchor) {
+    const link = el("a", "fj-link", label);
+    link.href = `${README_URL}${anchor}`;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.dataset.action = "openDocs";
+    link.dataset.url = link.href;
+    return link;
+  }
+
+  // One row of deep links into the README's relay chapters.
+  function docLinks(items) {
+    const row = el("div", "fj-docs");
+    row.append(el("span", "fj-docs-label", "Relay guide"));
+    for (const [label, anchor] of items) row.append(docLink(label, anchor));
+    return row;
+  }
+
+  // The only external link the panel opens is the project README, and only
+  // from a constant URL. A peer-supplied URL never reaches here.
+  function openExternal(url) {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return;
+    }
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.hostname !== "github.com" ||
+      !parsed.pathname.startsWith("/Vineeth-0/freejam/")
+    ) {
+      return;
+    }
+    try {
+      window.open(parsed.toString(), "_blank", "noopener,noreferrer");
+    } catch (err) {
+      console.warn("[FreeJam] Could not open the README", err);
+    }
+  }
+
   function buildSyncSetupCard() {
     const wrap = el("div", "fj-card");
 
     const head = el("div", "fj-card-head");
-    head.append(el("div", "fj-card-title", "Playback sync"));
+    head.append(el("div", "fj-card-title", "Start a FreeJam session"));
     head.append(el("span", "fj-badge", "Beta"));
     wrap.append(head);
 
@@ -2446,6 +3190,14 @@
       )
     );
 
+    wrap.append(
+      docLinks([
+        ["Where relays come from", "#3-where-the-relay-comes-from"],
+        ["Hosting options", "#6-pick-a-hosting-model"],
+        ["Self-host step by step", "#7-self-host-step-by-step"],
+      ])
+    );
+
     return wrap;
   }
 
@@ -2491,7 +3243,14 @@
 
     const actions = el("div", "fj-actions");
     if (sync.role === "host") {
-      actions.append(actionButton("announceJam", "Invite all friends", "secondary"));
+      actions.append(
+        actionButton("socialShareInvite", "Invite friends", "secondary")
+      );
+      if (friends.identity && friends.list.length) {
+        actions.append(
+          actionButton("announceJam", "Send to relay friends", "secondary")
+        );
+      }
     }
     if (sync.role === "guest") {
       actions.append(actionButton("syncResync", "Resync", "secondary"));
@@ -2499,51 +3258,11 @@
     actions.append(actionButton("syncLeave", "Leave sync", "danger"));
     wrap.append(actions);
 
-    return wrap;
-  }
-
-  function buildFriendsSetupCard() {
-    const wrap = el("div", "fj-card");
-
-    const head = el("div", "fj-card-head");
-    head.append(el("div", "fj-card-title", "Friends"));
-    head.append(el("span", "fj-badge off", "Setup"));
-    wrap.append(head);
-
     wrap.append(
-      el(
-        "div",
-        "fj-hint",
-        "Add friends to get an alert when they start a jam. Only people you add can send you an invite — FreeJam never broadcasts to everyone."
-      )
-    );
-
-    const nameRow = el("div", "fj-row");
-    const nameInput = document.createElement("input");
-    nameInput.className = "fj-input fj-name";
-    nameInput.placeholder = "Your name";
-    nameInput.value = sync.name || "";
-    nameInput.dataset.fj = "friendName";
-    nameRow.append(nameInput);
-    wrap.append(nameRow);
-
-    const relayRow = el("div", "fj-row");
-    const relayInput = document.createElement("input");
-    relayInput.className = "fj-input";
-    relayInput.placeholder = "Your own relay: wss://your-relay.example.com";
-    relayInput.value = state.lastRelayUrl || sync.relayUrl || "";
-    relayInput.dataset.fj = "friendRelay";
-    const createButton = el("button", "fj-btn", "Create my friend code");
-    createButton.dataset.action = "friendsCreate";
-    relayRow.append(relayInput, createButton);
-    wrap.append(relayRow);
-
-    wrap.append(
-      el(
-        "div",
-        "fj-hint",
-        "Use the relay you host yourself (the same one as your sync sessions). Friends outside your network need a wss:// address."
-      )
+      docLinks([
+        ["How to get a relay", "#3-where-the-relay-comes-from"],
+        ["Hosting options", "#6-pick-a-hosting-model"],
+      ])
     );
 
     return wrap;
@@ -2557,6 +3276,548 @@
     if (parts.length === 0) return "?";
     if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
     return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
+  }
+
+  function buildAvatar(name, imageUrl, options = {}) {
+    const avatar = el("span", "fj-avatar");
+    if (options.offline) avatar.classList.add("off");
+
+    if (imageUrl) {
+      const image = document.createElement("img");
+      image.className = "fj-avatar-img";
+      image.src = imageUrl;
+      image.alt = "";
+      image.loading = "lazy";
+      image.addEventListener("error", () => {
+        image.remove();
+        avatar.textContent = friendInitials(name);
+      });
+      avatar.append(image);
+    } else {
+      avatar.textContent = friendInitials(name);
+    }
+
+    if (options.online) avatar.append(el("span", "fj-dot"));
+    return avatar;
+  }
+
+  function socialTabButton(tab, label) {
+    const button = el(
+      "button",
+      `fj-tab${social.tab === tab ? " active" : ""}`,
+      label
+    );
+    button.type = "button";
+    button.dataset.action = "socialTab";
+    button.dataset.tab = tab;
+    button.setAttribute("aria-pressed", social.tab === tab ? "true" : "false");
+    return button;
+  }
+
+  function buildSocialProfileRow(profile, options = {}) {
+    const row = el("div", "fj-item");
+
+    row.append(
+      buildAvatar(profile.name, profile.imageUrl, {
+        online: options.online,
+        offline: options.online === false,
+      })
+    );
+
+    const info = el("div", "fj-item-info");
+    info.append(el("div", "fj-item-name", profile.name));
+    info.append(
+      el("div", "fj-item-meta", options.meta || `@${profile.username}`)
+    );
+    row.append(info);
+
+    const actions = el("div", "fj-item-actions");
+
+    if (options.follow !== null && options.follow !== undefined) {
+      const busy = social.followBusy.has(profile.username);
+      const following = Boolean(options.follow);
+      const followButton = el(
+        "button",
+        `fj-btn small${following ? " secondary" : ""}`,
+        busy ? "…" : following ? "Following" : "Follow"
+      );
+      followButton.dataset.action = following
+        ? "socialUnfollow"
+        : "socialFollow";
+      followButton.dataset.username = profile.username;
+      followButton.disabled = busy;
+      actions.append(followButton);
+    }
+
+    if (options.invite && buildLocalJam()) {
+      const invite = el("button", "fj-btn small secondary", "Invite");
+      invite.dataset.action = "socialInvite";
+      invite.dataset.username = profile.username;
+      invite.dataset.name = profile.name;
+      invite.dataset.image = profile.imageUrl || "";
+      actions.append(invite);
+    }
+
+    const open = el("button", "fj-btn small ghost", "Profile");
+    open.dataset.action = "socialOpenProfile";
+    open.dataset.username = profile.username;
+    actions.append(open);
+
+    row.append(actions);
+    return row;
+  }
+
+  function buildActivityRow(entry) {
+    const row = el("div", "fj-item");
+    row.append(buildAvatar(entry.name, entry.imageUrl, { online: true }));
+
+    const info = el("div", "fj-item-info");
+    info.append(el("div", "fj-item-name", entry.name));
+
+    const meta = el("div", "fj-item-meta");
+    if (entry.track && entry.track.name) {
+      const track = el("span", "fj-item-track");
+      track.append(el("span", "fj-live", "●"));
+      track.append(
+        el(
+          "span",
+          null,
+          `${entry.track.name}${
+            entry.track.artist ? ` · ${entry.track.artist}` : ""
+          }`
+        )
+      );
+      meta.append(track);
+    } else {
+      meta.textContent = "Listening on Spotify";
+    }
+    if (entry.timestamp) {
+      meta.append(document.createTextNode(` · ${timeAgo(entry.timestamp)}`));
+    }
+    info.append(meta);
+    row.append(info);
+
+    const actions = el("div", "fj-item-actions");
+    if (buildLocalJam()) {
+      const invite = el("button", "fj-btn small secondary", "Invite");
+      invite.dataset.action = "socialInvite";
+      invite.dataset.username = entry.username;
+      invite.dataset.name = entry.name;
+      invite.dataset.image = entry.imageUrl || "";
+      actions.append(invite);
+    }
+    const open = el("button", "fj-btn small ghost", "Profile");
+    open.dataset.action = "socialOpenProfile";
+    open.dataset.username = entry.username;
+    actions.append(open);
+    row.append(actions);
+    return row;
+  }
+
+  function socialEmptyText(tab) {
+    if (tab === "following") {
+      return "You are not following anyone yet. Open Find to search for Spotify profiles.";
+    }
+    if (tab === "followers") {
+      return "No followers yet.";
+    }
+    return "Nobody is sharing Listening Activity right now. Follow people on Spotify to see them here.";
+  }
+
+  function buildFindBody() {
+    const wrap = el("div", "fj-block");
+    wrap.append(
+      el(
+        "div",
+        "fj-hint",
+        "Spotify search opens the Profiles tab, where you can follow people. People you follow appear here with their Listening Activity."
+      )
+    );
+
+    const row = el("div", "fj-row");
+    const input = document.createElement("input");
+    input.className = "fj-input";
+    input.placeholder = "Name or username";
+    input.dataset.fj = "socialSearch";
+    const button = el("button", "fj-btn", "Search profiles");
+    button.dataset.action = "socialSearch";
+    row.append(input, button);
+    wrap.append(row);
+    return wrap;
+  }
+
+  function buildRelayDetails() {
+    const details = document.createElement("details");
+    details.className = "fj-relay-details";
+    details.open = social.relayOpen;
+    details.addEventListener("toggle", () => {
+      social.relayOpen = details.open;
+    });
+
+    const summary = document.createElement("summary");
+    summary.append(el("span", null, "Relay invites (optional)"));
+    summary.append(
+      el(
+        "span",
+        `fj-badge${friends.connected ? "" : " off"}`,
+        friends.connected ? "On" : friends.identity ? "Offline" : "Off"
+      )
+    );
+    details.append(summary);
+
+    const body = el("div", "fj-relay-body");
+    body.append(
+      el(
+        "div",
+        "fj-hint",
+        "Spotify has no API for sending a jam invite. If you and a friend both use the same self-hosted relay, FreeJam can push the invite automatically. Everyone else: use Share invite and send the code yourself."
+      )
+    );
+    body.append(
+      docLinks([["How to get a relay", "#3-where-the-relay-comes-from"]])
+    );
+
+    if (!friends.identity) {
+      const nameRow = el("div", "fj-row");
+      const nameInput = document.createElement("input");
+      nameInput.className = "fj-input fj-name";
+      nameInput.placeholder = "Your name";
+      nameInput.value = sync.name || "";
+      nameInput.dataset.fj = "friendName";
+      nameRow.append(nameInput);
+      body.append(nameRow);
+
+      const relayRow = el("div", "fj-row");
+      const relayInput = document.createElement("input");
+      relayInput.className = "fj-input";
+      relayInput.placeholder = "Your own relay: wss://your-relay.example.com";
+      relayInput.value = state.lastRelayUrl || sync.relayUrl || "";
+      relayInput.dataset.fj = "friendRelay";
+      const create = el("button", "fj-btn", "Enable relay invites");
+      create.dataset.action = "friendsCreate";
+      relayRow.append(relayInput, create);
+      body.append(relayRow);
+
+      details.append(body);
+      return details;
+    }
+
+    const status = el("div", "fj-status fj-sync-status");
+    const dot = el("span", "fj-dot");
+    if (!friends.connected) dot.classList.add("off");
+    status.append(
+      dot,
+      el(
+        "span",
+        null,
+        friends.connected
+          ? `Connected · ${friends.list.length} friend${
+              friends.list.length === 1 ? "" : "s"
+            }`
+          : friends.error || "Connecting to the friend relay…"
+      )
+    );
+    body.append(status);
+
+    if (!friends.identity.relayUrl) {
+      body.append(
+        el(
+          "div",
+          "fj-warn",
+          "Add the relay URL in Settings so friends can reach you."
+        )
+      );
+    }
+
+    const codeRow = el("div", "fj-row");
+    const codeInput = document.createElement("input");
+    codeInput.className = "fj-input fj-mono";
+    codeInput.readOnly = true;
+    codeInput.value = encodeFriendCode(friends.identity);
+    codeInput.dataset.fj = "friendCode";
+    codeInput.addEventListener("focus", () => codeInput.select());
+    const copyCode = el("button", "fj-btn", "Copy my code");
+    copyCode.dataset.action = "friendsCopyCode";
+    codeRow.append(codeInput, copyCode);
+    body.append(codeRow);
+
+    const actions = el("div", "fj-actions");
+    actions.append(
+      actionButton("friendsCopyMessage", "Copy friend invite", "secondary")
+    );
+    if (!friends.connected && friends.identity.relayUrl) {
+      actions.append(
+        actionButton("friendsReconnect", "Reconnect", "secondary")
+      );
+    }
+    if (friends.list.length && buildLocalJam()) {
+      actions.append(
+        actionButton("announceJam", "Send jam to all", "secondary")
+      );
+    }
+    body.append(actions);
+
+    body.append(el("div", "fj-divider"));
+    body.append(el("div", "fj-subtitle", "Add a relay friend"));
+
+    const addRow = el("div", "fj-row");
+    const addInput = document.createElement("input");
+    addInput.className = "fj-input fj-mono";
+    addInput.placeholder = "Paste their FJF1 friend code";
+    addInput.dataset.fj = "friendCodeInput";
+    const addButton = el("button", "fj-btn", "Add friend");
+    addButton.dataset.action = "friendsAdd";
+    addRow.append(addInput, addButton);
+    body.append(addRow);
+
+    const list = el("div", "fj-list");
+    if (friends.list.length === 0) {
+      list.append(
+        el(
+          "div",
+          "fj-empty",
+          "No relay friends yet. Send them your code, then paste theirs here."
+        )
+      );
+    } else {
+      for (const friend of friends.list) {
+        list.append(buildFriendRow(friend));
+      }
+    }
+    body.append(list);
+
+    body.append(
+      el(
+        "div",
+        "fj-hint",
+        "Your code contains a send key, not your private receive key. Friends can send you invites, but cannot read your mailbox or impersonate you."
+      )
+    );
+
+    details.append(body);
+    return details;
+  }
+
+  function buildInviteComposer() {
+    const wrap = el("div", "fj-card");
+    const target = social.composeTarget;
+
+    const head = el("div", "fj-card-head");
+    const back = el("button", "fj-btn ghost small", "← Back");
+    back.dataset.action = "socialComposeBack";
+    head.append(back);
+    wrap.append(head);
+
+    const jam = buildLocalJam();
+    const hero = el("div", "fj-invite-hero");
+
+    const avatars = el("div", "fj-invite-avatars");
+    avatars.append(
+      buildAvatar(
+        (social.me && social.me.name) || friendIdentityName(),
+        (social.me && social.me.imageUrl) || ""
+      )
+    );
+    if (target) {
+      avatars.append(buildAvatar(target.name, target.imageUrl));
+    }
+    hero.append(avatars);
+
+    hero.append(el("div", "fj-invite-kicker", "FreeJam invite"));
+    hero.append(
+      el(
+        "div",
+        "fj-invite-title",
+        jam
+          ? `Join ${friendIdentityName()}'s playback sync`
+          : "Start a sync to invite friends"
+      )
+    );
+    hero.append(
+      el(
+        "div",
+        "fj-invite-sub",
+        target
+          ? `Send this to ${target.name}. They need FreeJam installed.`
+          : "Send this to anyone you want in the session."
+      )
+    );
+    wrap.append(hero);
+
+    if (!jam) {
+      wrap.append(
+        el(
+          "div",
+          "fj-hint",
+          "Host a playback sync first. The invite carries its join code."
+        )
+      );
+      return wrap;
+    }
+
+    const codeCard = el("div", "fj-code-card");
+    const codeInput = document.createElement("input");
+    codeInput.className = "fj-input fj-mono";
+    codeInput.readOnly = true;
+    codeInput.value = jam.joinCode;
+    codeInput.dataset.fj = "inviteCode";
+    codeInput.addEventListener("focus", () => codeInput.select());
+    const copyCode = el("button", "fj-btn small", "Copy code");
+    copyCode.dataset.action = "socialCopyInviteCode";
+    codeCard.append(codeInput, copyCode);
+    wrap.append(codeCard);
+
+    const actions = el("div", "fj-actions");
+    const copyInvite = el("button", "fj-btn", "Copy invite");
+    copyInvite.dataset.action = "socialCopyInvite";
+    actions.append(copyInvite);
+
+    if (target) {
+      const profile = el("button", "fj-btn secondary", "Open profile");
+      profile.dataset.action = "socialOpenProfile";
+      profile.dataset.username = target.username;
+      actions.append(profile);
+    }
+
+    if (friends.connected && friends.list.length) {
+      const send = el("button", "fj-btn secondary", "Send to relay friends");
+      send.dataset.action = "socialSendRelay";
+      actions.append(send);
+    }
+    wrap.append(actions);
+
+    wrap.append(
+      el(
+        "div",
+        "fj-hint",
+        "Copy invite puts the message and join code on your clipboard for any chat. Spotify's desktop app does not expose a messaging API, so FreeJam cannot send a Spotify DM for you."
+      )
+    );
+
+    return wrap;
+  }
+
+  function buildFriendsCard() {
+    const wrap = el("div", "fj-card");
+
+    const head = el("div", "fj-card-head");
+    head.append(el("div", "fj-card-title", "Friends"));
+    const listening = social.activity.length;
+    const badge = el(
+      "span",
+      "fj-badge",
+      social.loading.activity && !social.loadedAt.activity
+        ? "Loading"
+        : `${listening} listening`
+    );
+    if (!listening) badge.classList.add("off");
+    head.append(badge);
+    wrap.append(head);
+
+    const incoming = friends.incomingJam;
+    if (incoming) {
+      const box = el("div", "fj-status fj-jam");
+      box.append(
+        buildAvatar(incoming.fromName || "A friend", "", { online: true })
+      );
+
+      const info = el("div", "fj-item-info");
+      info.append(
+        el(
+          "div",
+          "fj-item-name",
+          `${incoming.fromName || "A friend"} started a playback sync`
+        )
+      );
+      info.append(
+        el("div", "fj-item-meta", timeAgo(incoming.at || Date.now()))
+      );
+      box.append(info);
+
+      const join = el("button", "fj-btn", "Join jam");
+      join.dataset.action = "friendsJoin";
+      const dismiss = el("button", "fj-btn secondary", "Dismiss");
+      dismiss.dataset.action = "friendsDismiss";
+      box.append(join, dismiss);
+      wrap.append(box);
+    }
+
+    if (social.me) {
+      const me = el("div", "fj-me");
+      me.append(buildAvatar(social.me.name, social.me.imageUrl));
+
+      const info = el("div", "fj-me-info");
+      info.append(el("div", "fj-me-name", social.me.name));
+      if (social.me.handle) {
+        info.append(el("div", "fj-me-handle", `@${social.me.handle}`));
+      }
+      me.append(info);
+
+      const mine = el("button", "fj-btn small secondary", "My profile");
+      mine.dataset.action = "socialOpenProfile";
+      mine.dataset.username = social.me.username;
+      me.append(mine);
+
+      const followers = el("button", "fj-btn small ghost", "Followers");
+      followers.dataset.action = "socialOpenFollowers";
+      followers.dataset.username = social.me.username;
+      me.append(followers);
+
+      wrap.append(me);
+    }
+
+    const tabs = el("div", "fj-tabs");
+    tabs.append(socialTabButton("activity", "Activity"));
+    tabs.append(socialTabButton("following", "Following"));
+    tabs.append(socialTabButton("followers", "Followers"));
+    tabs.append(socialTabButton("find", "Find"));
+    wrap.append(tabs);
+
+    if (social.error) wrap.append(el("div", "fj-warn", social.error));
+
+    const list = el("div", "fj-social-list");
+    if (social.tab === "find") {
+      list.append(buildFindBody());
+    } else {
+      const entries =
+        social.tab === "activity" ? social.activity : social[social.tab];
+      const loading = social.loading[social.tab];
+
+      if (loading && entries.length === 0) {
+        list.append(el("div", "fj-social-empty", "Loading…"));
+      } else if (entries.length === 0) {
+        list.append(el("div", "fj-social-empty", socialEmptyText(social.tab)));
+      } else {
+        for (const entry of entries) {
+          list.append(
+            social.tab === "activity"
+              ? buildActivityRow(entry)
+              : buildSocialProfileRow(entry, {
+                  follow:
+                    social.tab === "following" ? true : entry.isFollowing,
+                  invite: true,
+                })
+          );
+        }
+      }
+    }
+    wrap.append(list);
+
+    const actions = el("div", "fj-actions");
+    const refresh = el("button", "fj-btn ghost small", "Refresh");
+    refresh.dataset.action = "socialRefresh";
+    actions.append(refresh);
+
+    if (buildLocalJam()) {
+      const share = el("button", "fj-btn secondary small", "Share invite");
+      share.dataset.action = "socialShareInvite";
+      actions.append(share);
+    }
+    wrap.append(actions);
+
+    wrap.append(buildRelayDetails());
+
+    return wrap;
   }
 
   function syncMemberForFriend(friend) {
@@ -2651,7 +3912,7 @@
     wrap.append(
       settingRow(
         "Desktop notifications",
-        "Show a Windows or macOS notification when a friend starts a jam.",
+        "Show a Windows or macOS notification when a relay friend starts a jam.",
         switchButton(
           "settingsToggleOs",
           "Desktop notifications",
@@ -2711,7 +3972,7 @@
         el(
           "div",
           "fj-hint",
-          "Create your friend code in Friends to set up background alerts and the relay."
+          "Create your friend code under Friends → Relay invites (optional) to set up background alerts and the relay."
         )
       );
     }
@@ -2743,7 +4004,7 @@
 
     const sections = [
       ["sync", "Playback sync", "Relay setup for synced playback."],
-      ["friends", "Friends", "Friend codes and your friend list."],
+      ["friends", "Friends", "Spotify activity, follows and invites."],
       ["hint", "Help text", "The explanation at the bottom of the panel."],
     ];
 
@@ -2784,6 +4045,12 @@
     relayRow.append(relayInput, saveRelay);
     wrap.append(relayRow);
 
+    wrap.append(
+      docLinks([
+        ["Point FreeJam at the relay", "#8-point-freejam-at-the-relay"],
+      ])
+    );
+
     return wrap;
   }
 
@@ -2823,133 +4090,37 @@
     renderSettingsSection(container);
   }
 
-  function buildFriendsCard() {
-    const wrap = el("div", "fj-card");
-
-    const head = el("div", "fj-card-head");
-    head.append(el("div", "fj-card-title", "Friends"));
-
-    const onlineCount = friends.list.filter((friend) =>
-      friends.online.has(friend.userId)
-    ).length;
-    const badge = el(
-      "span",
-      "fj-badge",
-      friends.connected
-        ? `${onlineCount}/${friends.list.length} online`
-        : "Offline"
-    );
-    if (!friends.connected) badge.classList.add("off");
-    head.append(badge);
-    wrap.append(head);
-
-    const status = el("div", "fj-status fj-sync-status");
-    const statusDot = el("span", "fj-dot");
-    let statusText;
-    if (!friends.identity.relayUrl) {
-      statusDot.classList.add("off");
-      statusText = "Set a relay in Settings so friends can reach you.";
-    } else if (!friends.connected) {
-      statusDot.classList.add("off");
-      statusText = friends.error || "Connecting to the friend relay…";
-    } else {
-      const latency = friends.latencyMs ? `${friends.latencyMs}ms` : "measuring";
-      statusText = `Connected · ${onlineCount} of ${friends.list.length} friends online · ${latency}`;
-    }
-    status.append(statusDot, el("span", null, statusText));
-    wrap.append(status);
-
-    const jam = friends.incomingJam;
-    if (jam) {
-      const box = el("div", "fj-status fj-jam");
-      box.append(el("span", "fj-dot"));
-      const info = el("div", "fj-item-info");
-      info.append(
-        el(
-          "div",
-          "fj-item-name",
-          `${jam.fromName || "A friend"} · playback sync`
-        )
-      );
-      info.append(el("div", "fj-item-meta", timeAgo(jam.at || Date.now())));
-      box.append(info);
-
-      const join = el("button", "fj-btn", "Join jam");
-      join.dataset.action = "friendsJoin";
-      const dismiss = el("button", "fj-btn secondary", "Dismiss");
-      dismiss.dataset.action = "friendsDismiss";
-      box.append(join, dismiss);
-      wrap.append(box);
-    }
-
-    const codeRow = el("div", "fj-row");
-    const codeInput = document.createElement("input");
-    codeInput.className = "fj-input fj-mono";
-    codeInput.readOnly = true;
-    codeInput.value = encodeFriendCode(friends.identity);
-    codeInput.dataset.fj = "friendCode";
-    codeInput.addEventListener("focus", () => codeInput.select());
-    const copyCode = el("button", "fj-btn", "Copy my code");
-    copyCode.dataset.action = "friendsCopyCode";
-    codeRow.append(codeInput, copyCode);
-    wrap.append(codeRow);
-
-    const actions = el("div", "fj-actions");
-    actions.append(
-      actionButton("friendsCopyMessage", "Copy invite message", "secondary")
-    );
-    if (!friends.connected && friends.identity.relayUrl) {
-      actions.append(
-        actionButton("friendsReconnect", "Reconnect", "secondary")
-      );
-    }
-    wrap.append(actions);
-
-    wrap.append(el("div", "fj-divider"));
-    wrap.append(el("div", "fj-subtitle", "Add a friend"));
-
-    const addRow = el("div", "fj-row");
-    const addInput = document.createElement("input");
-    addInput.className = "fj-input fj-mono";
-    addInput.placeholder = "Paste their FJF1 friend code";
-    addInput.dataset.fj = "friendCodeInput";
-    const addButton = el("button", "fj-btn", "Add friend");
-    addButton.dataset.action = "friendsAdd";
-    addRow.append(addInput, addButton);
-    wrap.append(addRow);
-
-    const list = el("div", "fj-list");
-    if (friends.list.length === 0) {
-      list.append(
-        el(
-          "div",
-          "fj-empty",
-          "No friends yet. Send them your code, then paste theirs here."
-        )
-      );
-    } else {
-      for (const friend of friends.list) {
-        list.append(buildFriendRow(friend));
-      }
-    }
-    wrap.append(list);
-
-    wrap.append(
-      el(
-        "div",
-        "fj-hint",
-        "Your code contains a send key, not your private receive key. Friends can send you jams, but cannot read your mailbox or impersonate you."
-      )
-    );
-
-    return wrap;
-  }
-
   function renderFriendsSection(container) {
     if (!container) return;
 
     const key = [
-      friends.identity ? "id" : "none",
+      social.view,
+      social.view === "compose" && social.composeTarget
+        ? social.composeTarget.username
+        : "",
+      social.me
+        ? `${social.me.username}:${social.me.name}:${social.me.handle || ""}`
+        : "no-me",
+      social.tab,
+      social.loading[social.tab] ? "loading" : "",
+      social.error,
+      social.loadedAt[social.tab],
+      social.activity
+        .map(
+          (entry) =>
+            `${entry.username}:${entry.timestamp}:${
+              entry.track ? entry.track.uri : ""
+            }`
+        )
+        .join(","),
+      social.following
+        .map((entry) => `${entry.username}:${entry.isFollowing}`)
+        .join(","),
+      social.followers
+        .map((entry) => `${entry.username}:${entry.isFollowing}`)
+        .join(","),
+      Array.from(social.followBusy).sort().join(","),
+      friends.identity ? "relay" : "norelay",
       friends.identity ? friends.identity.relayUrl : "",
       friends.connected ? "on" : "off",
       friends.error || "",
@@ -2968,7 +4139,7 @@
     if (container.dataset.renderKey === key) return;
     container.dataset.renderKey = key;
     container.replaceChildren(
-      friends.identity ? buildFriendsCard() : buildFriendsSetupCard()
+      social.view === "compose" ? buildInviteComposer() : buildFriendsCard()
     );
   }
 
@@ -3073,6 +4244,38 @@
     }
   }
 
+  const PANES = ["sync", "friends", "settings"];
+
+  function paneAvailable(pane) {
+    return pane === "settings" || layout[pane] !== false;
+  }
+
+  // Show the selected pane and mark its tab. A pane hidden in Settings falls
+  // back to the first one that is still visible.
+  function applyPane() {
+    const root = ui.root;
+    if (!root) return;
+
+    if (!paneAvailable(ui.pane)) {
+      ui.pane = PANES.find(paneAvailable) || "settings";
+    }
+
+    for (const pane of root.querySelectorAll("[data-pane]")) {
+      pane.classList.toggle("is-active", pane.dataset.pane === ui.pane);
+    }
+    for (const tab of root.querySelectorAll("[data-pane-tab]")) {
+      const active = tab.dataset.tab === ui.pane;
+      tab.classList.toggle("active", active);
+      tab.setAttribute("aria-selected", active ? "true" : "false");
+    }
+  }
+
+  function setPane(pane) {
+    if (!PANES.includes(pane)) return;
+    ui.pane = pane;
+    applyPane();
+  }
+
   function applyLayout() {
     const root = ui.root;
     if (!root) return;
@@ -3080,6 +4283,73 @@
       const key = node.dataset.fjSection;
       node.hidden = layout[key] === false;
     }
+    for (const tab of root.querySelectorAll("[data-pane-tab]")) {
+      tab.hidden = !paneAvailable(tab.dataset.tab);
+    }
+    applyPane();
+  }
+
+  function renderClipboardCard(container) {
+    if (!container) return;
+    const jam = social.clipboardJam;
+
+    if (!jam) {
+      if (container.childElementCount) container.replaceChildren();
+      return;
+    }
+
+    const box = el("div", "fj-status fj-jam fj-clipboard");
+    box.append(el("span", "fj-dot"));
+
+    const info = el("div", "fj-item-info");
+    info.append(el("div", "fj-item-name", "Jam code found on your clipboard"));
+    info.append(
+      el("div", "fj-item-meta", "Join the playback sync it points to.")
+    );
+    box.append(info);
+
+    const join = el("button", "fj-btn", "Join jam");
+    join.dataset.action = "clipboardJoin";
+    const dismiss = el("button", "fj-btn secondary", "Dismiss");
+    dismiss.dataset.action = "clipboardDismiss";
+    box.append(join, dismiss);
+
+    container.replaceChildren(box);
+  }
+
+  // The status bar above the tabs. Rebuilt only when the text changes.
+  function renderHero(container) {
+    if (!container) return;
+
+    const active = Boolean(sync.role);
+    const connected = active && sync.connected;
+    const host = active && sync.role === "host";
+    const count = Math.max(sync.members.length, 1);
+
+    let text;
+    let idle = false;
+
+    if (!active) {
+      idle = true;
+      text = "No playback sync. Start one below — no Premium needed.";
+    } else if (!connected) {
+      idle = true;
+      text = sync.error || "Connecting to the relay…";
+    } else if (host) {
+      text = `Playback sync active · ${count} connected.`;
+    } else if (sync.hostId) {
+      text = `Following ${sync.hostName || "the host"} · ${count} connected.`;
+    } else {
+      idle = true;
+      text = "Connected. Waiting for the host to start playback sync.";
+    }
+
+    if (container.dataset.heroKey === text) return;
+    container.dataset.heroKey = text;
+
+    const dot = el("span", "fj-dot");
+    if (idle) dot.classList.add("off");
+    container.replaceChildren(dot, el("span", "fj-hero-text", text));
   }
 
   function updatePanel() {
@@ -3090,36 +4360,22 @@
     }
 
     const status = $('[data-fj="status"]', root);
+    const clipboardContainer = $('[data-fj="clipboard"]', root);
     const syncContainer = $('[data-fj="sync"]', root);
     const friendsContainer = $('[data-fj="friends"]', root);
     const settingsContainer = $('[data-fj="settings"]', root);
     const hint = $('[data-fj="hint"]', root);
 
-    if (status) {
-      status.replaceChildren();
-      const dot = el("span", "fj-dot");
-      let text;
-
-      if (!sync.role) {
-        dot.classList.add("off");
-        text = "No playback sync. Start one below — no Premium needed.";
-      } else if (!sync.connected) {
-        dot.classList.add("off");
-        text = "Playback sync is connecting…";
-      } else {
-        text = `Playback sync active · ${sync.members.length || 1} connected.`;
-      }
-
-      status.append(dot, el("span", null, text));
-    }
+    if (status) renderHero(status);
 
     if (syncContainer) renderSyncSection(syncContainer);
     if (friendsContainer) renderFriendsSection(friendsContainer);
     if (settingsContainer) renderSettingsSection(settingsContainer);
+    if (clipboardContainer) renderClipboardCard(clipboardContainer);
 
     if (hint) {
       hint.textContent =
-        "Use Spotify's normal player controls to control playback. Everyone in the sync follows the host. Friends get an alert when you start a sync.";
+        "Use Spotify's normal player controls to control playback. Everyone in the sync follows the host. Follow people on Spotify to see their Listening Activity, and share a jam invite from Friends.";
     }
 
     applyLayout();
@@ -3129,58 +4385,76 @@
     const root = document.createElement("div");
     root.className = "fj-root";
     root.innerHTML = `
-      <div class="fj-status" data-fj="status"></div>
-      <details class="fj-section" data-fj-section="sync">
-        <summary><span class="fj-section-label">Playback sync</span><span class="fj-section-sub">Relay setup</span></summary>
+      <div class="fj-hero" data-fj="status"></div>
+      <div data-fj="clipboard"></div>
+      <div class="fj-tabs fj-panel-tabs" role="tablist" aria-label="FreeJam">
+        <button class="fj-tab" type="button" role="tab" data-action="panelTab" data-pane-tab data-tab="sync">Sync</button>
+        <button class="fj-tab" type="button" role="tab" data-action="panelTab" data-pane-tab data-tab="friends">Friends</button>
+        <button class="fj-tab" type="button" role="tab" data-action="panelTab" data-pane-tab data-tab="settings">Settings</button>
+      </div>
+      <section class="fj-pane" data-pane="sync" data-fj-section="sync">
         <div class="fj-section-body" data-fj="sync"></div>
-      </details>
-      <details class="fj-section" data-fj-section="friends">
-        <summary><span class="fj-section-label">Friends</span><span class="fj-section-sub">Codes and invites</span></summary>
+      </section>
+      <section class="fj-pane" data-pane="friends" data-fj-section="friends">
         <div class="fj-section-body" data-fj="friends"></div>
-      </details>
-      <details class="fj-section">
-        <summary><span class="fj-section-label">Settings</span><span class="fj-section-sub">Alerts and panel</span></summary>
+      </section>
+      <section class="fj-pane" data-pane="settings" data-fj-section="settings">
         <div class="fj-section-body" data-fj="settings"></div>
-      </details>
+      </section>
       <div class="fj-hint" data-fj="hint" data-fj-section="hint"></div>
     `;
-    root.addEventListener("click", onPanelClick);
-    // Accordion: opening one section closes the others, so the panel stays small.
-    root.addEventListener(
-      "toggle",
-      (event) => {
-        const opened = event.target;
-        if (!(opened instanceof HTMLDetailsElement) || !opened.open) return;
-        for (const other of root.querySelectorAll("details.fj-section[open]")) {
-          if (other !== opened) other.open = false;
-        }
-      },
-      true
-    );
+    root.addEventListener("click", (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
 
+      const button = target.closest("[data-action]");
+      if (!button || !root.contains(button)) return;
+
+      // Cancel link navigation right away, then run the action on the next
+      // task. Most actions rebuild part of the panel, and replacing the node
+      // that is still the target of an in-flight click makes Spotify's React
+      // tree lose the event and tear the modal down, so the click looks like a
+      // crash. Deferring also keeps the click from reaching the modal's own
+      // document-level handlers.
+      if (button.tagName === "A") event.preventDefault();
+      event.stopPropagation();
+      setTimeout(() => {
+        onPanelClick(button).catch((err) => {
+          console.error("[FreeJam]", err);
+        });
+      }, 0);
+    });
+
+    ui.pane = "sync";
     ui.root = root;
     Spicetify.PopupModal.display({
       title: "FreeJam",
       content: root,
-      isLarge: false,
+      isLarge: true,
     });
     // The popup must be attached before updatePanel() runs: it deliberately
     // skips work for detached roots so a closed modal does not keep rendering.
     updatePanel();
+
+    detectClipboardInvite();
+    ensureSocialData(false);
   }
 
-  async function onPanelClick(event) {
-    const target = event.target;
-    if (!(target instanceof Element)) return;
-
-    const button = target.closest("[data-action]");
-    if (!button || !ui.root || !ui.root.contains(button)) return;
-    if (busy) return;
+  async function onPanelClick(button) {
+    if (!ui.root || busy) return;
 
     const action = button.dataset.action;
 
     try {
       switch (action) {
+        case "openDocs": {
+          openExternal(button.dataset.url);
+          break;
+        }
+        case "panelTab": {
+          setPane(button.dataset.tab);
+          break;
+        }
         case "announceJam": {
           if (!friends.identity) {
             Spicetify.showNotification(
@@ -3212,6 +4486,138 @@
           );
           break;
         }
+        case "socialTab": {
+          const tab = button.dataset.tab;
+          if (!["activity", "following", "followers", "find"].includes(tab)) {
+            return;
+          }
+          social.tab = tab;
+          social.error = "";
+          refreshFriendsPanel();
+          if (tab === "activity") loadListeningActivity(false);
+          else if (tab === "following") loadSocialList("following", false);
+          else if (tab === "followers") loadSocialList("followers", false);
+          break;
+        }
+        case "socialRefresh": {
+          social.error = "";
+          refreshFriendsPanel();
+          ensureSocialData(true);
+          break;
+        }
+        case "socialFollow":
+        case "socialUnfollow": {
+          const username = button.dataset.username;
+          const profile =
+            social.activity.find((entry) => entry.username === username) ||
+            social.following.find((entry) => entry.username === username) ||
+            social.followers.find((entry) => entry.username === username) ||
+            (social.me && social.me.username === username
+              ? social.me
+              : null);
+          if (!profile) return;
+          await setFollowing(profile, action === "socialFollow");
+          break;
+        }
+        case "socialOpenProfile": {
+          openProfile(button.dataset.username);
+          break;
+        }
+        case "socialOpenFollowers": {
+          openProfile(button.dataset.username, "followers");
+          break;
+        }
+        case "socialSearch": {
+          const input = $('[data-fj="socialSearch"]', ui.root);
+          openPeopleSearch(input ? input.value : "");
+          break;
+        }
+        case "socialInvite": {
+          if (!buildLocalJam()) {
+            Spicetify.showNotification(
+              "Start a playback sync before inviting a friend.",
+              true
+            );
+            return;
+          }
+          social.composeTarget = {
+            username: button.dataset.username || "",
+            name: button.dataset.name || "a friend",
+            imageUrl: button.dataset.image || "",
+          };
+          social.view = "compose";
+          refreshFriendsPanel();
+          break;
+        }
+        case "socialShareInvite": {
+          if (!buildLocalJam()) {
+            Spicetify.showNotification(
+              "Start a playback sync before sharing an invite.",
+              true
+            );
+            return;
+          }
+          social.composeTarget = null;
+          social.view = "compose";
+          setPane("friends");
+          refreshFriendsPanel();
+          break;
+        }
+        case "socialComposeBack": {
+          social.view = "list";
+          social.composeTarget = null;
+          refreshFriendsPanel();
+          break;
+        }
+        case "socialCopyInvite": {
+          const message = buildJamInviteText(social.composeTarget);
+          if (!message) return;
+          const copied = await copyText(message);
+          Spicetify.showNotification(
+            copied
+              ? "Invite copied. Paste it in any chat."
+              : "Could not copy the invite.",
+            !copied
+          );
+          break;
+        }
+        case "socialCopyInviteCode": {
+          const jam = buildLocalJam();
+          if (!jam) return;
+          const copied = await copyText(jam.joinCode);
+          Spicetify.showNotification(
+            copied ? "Join code copied." : "Could not copy the join code.",
+            !copied
+          );
+          break;
+        }
+        case "socialSendRelay": {
+          if (!friends.identity) {
+            Spicetify.showNotification("Enable relay invites first.", true);
+            return;
+          }
+          if (!friends.list.length) {
+            Spicetify.showNotification("Add a relay friend first.", true);
+            return;
+          }
+          announceJam();
+          Spicetify.showNotification(
+            friends.connected
+              ? "Jam invite sent to your relay friends."
+              : "Invite queued. It will send when the relay reconnects."
+          );
+          break;
+        }
+        case "clipboardJoin":
+          joinClipboardJam();
+          break;
+        case "clipboardDismiss":
+          if (social.clipboardJam) {
+            social.clipboardDismissed = social.clipboardJam.code;
+          }
+          social.clipboardJam = null;
+          refreshPanelSections();
+          break;
         case "settingsToggleOs": {
           const on = button.getAttribute("aria-checked") !== "true";
           if (on) {

@@ -72,7 +72,7 @@ Friends only need the extension — not Node.js and not the relay. Send them
 They copy `freejam.js` into their Spicetify **Extensions** folder, run
 `spicetify apply`, and restart Spotify. Then either:
 
-- paste your `FJ1…` join code under **Playback sync → Join a sync session**, or
+- paste your `FJ1…` join code under **Sync → Join a sync session**, or
 - add your `FJF1…` friend code under **Friends → Add a friend**.
 
 The optional background notifier is only needed for alerts while Spotify is
@@ -81,11 +81,11 @@ fully closed. The full guide is this README; the bundle includes a copy of it as
 
 ### Panel layout
 
-The panel is built from collapsible sections. Open **Settings → Panel sections**
-to hide anything you do not use: **Playback sync**, **Friends**, or the help
-text. **Compact** keeps the sync and friends cards and hides the rest; **Show
-all** restores everything. Settings always stays visible so a hidden section can
-be brought back.
+The panel has three tabs: **Sync**, **Friends** and **Settings**. Open
+**Settings → Panel sections** to hide anything you do not use: the **Sync**
+tab, the **Friends** tab, or the help text. **Compact** keeps those two tabs
+and hides the rest; **Show all** restores everything. Settings always stays
+visible so a hidden tab can be brought back.
 
 ---
 
@@ -528,7 +528,7 @@ FreeJam relay listening on ws://0.0.0.0:8787
   LAN address: ws://192.168.x.x:8787
 ```
 
-Replace each `x` with the numbers shown by your relay; the address above is a placeholder. Allow Node through the firewall if prompted.
+Use the `192.168.x.x` address. Allow Node through the firewall if prompted.
 This only works while both devices are on the same network and the host PC is
 awake.
 
@@ -1050,8 +1050,7 @@ Repeat step 5 for each friend. When they add your code too, the card shows
 
 ### Desktop alerts and the ding
 
-Alert preferences live in the **Settings** section at the bottom of the FreeJam
-panel:
+Alert preferences live in the **Settings** tab of the FreeJam panel:
 
 - **Desktop notifications** — a native Windows/macOS notification. Turning it on
   asks Spotify for permission the first time. Clicking the notification brings
