@@ -32,6 +32,9 @@ const { spawn } = require("child_process");
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const CODE_PREFIX = "FJN1.";
 const MAX_BUFFER = 1024 * 1024;
+const MAX_MESSAGE = 64 * 1024;
+const MAX_FRAGMENTS = 128;
+const FRAGMENT_TIMEOUT_MS = 15000;
 const PING_INTERVAL_MS = 30000;
 const MAX_SEEN_JAMS = 100;
 
@@ -277,10 +280,15 @@ class RelaySocket {
     this.buffer = Buffer.alloc(0);
     this.fragments = [];
     this.fragmentOpcode = 0;
+    this.fragmentBytes = 0;
+    this.fragmentCount = 0;
+    this.fragmentTimer = null;
+    this.frameWindowStart = Date.now();
+    this.frameCount = 0;
     this.closed = false;
 
     socket.setNoDelay(true);
-    socket.setTimeout(0);
+    socket.setTimeout(60000, () => this.close(1001, "Idle timeout"));
     socket.on("data", (chunk) => this.feed(chunk));
     socket.on("close", () => this.finish(1006, "Connection closed"));
     socket.on("end", () => this.finish(1006, "Connection ended"));
@@ -292,11 +300,11 @@ class RelaySocket {
 
   feed(chunk) {
     if (this.closed) return;
-    this.buffer = Buffer.concat([this.buffer, chunk]);
-    if (this.buffer.length > MAX_BUFFER) {
+    if (this.buffer.length + chunk.length > MAX_BUFFER) {
       this.close(1009, "Message too large");
       return;
     }
+    this.buffer = Buffer.concat([this.buffer, chunk]);
     this.parse();
   }
 
@@ -309,6 +317,14 @@ class RelaySocket {
       const fin = (b1 & 0x80) !== 0;
       const opcode = b1 & 0x0f;
       const masked = (b2 & 0x80) !== 0;
+      if ((b1 & 0x70) !== 0 || masked) {
+        this.close(1002, "Invalid server frame");
+        return;
+      }
+      if (![0x0, 0x1, 0x2, 0x8, 0x9, 0xa].includes(opcode)) {
+        this.close(1002, "Unsupported frame");
+        return;
+      }
       let length = b2 & 0x7f;
       let headerLength = 2;
 
@@ -329,6 +345,10 @@ class RelaySocket {
 
       if (length > MAX_BUFFER) {
         this.close(1009, "Frame too large");
+        return;
+      }
+      if ((opcode & 0x08) && (!fin || length > 125)) {
+        this.close(1002, "Invalid control frame");
         return;
       }
 
@@ -356,6 +376,16 @@ class RelaySocket {
       }
 
       offset += headerLength + length;
+      const now = Date.now();
+      if (now - this.frameWindowStart > 1000) {
+        this.frameWindowStart = now;
+        this.frameCount = 0;
+      }
+      this.frameCount += 1;
+      if (this.frameCount > 240) {
+        this.close(1008, "Frame rate exceeded");
+        return;
+      }
       this.handleFrame(opcode, fin, payload);
     }
 
@@ -382,18 +412,41 @@ class RelaySocket {
     if (opcode === 0xa) return;
 
     if (opcode === 0x1 || opcode === 0x2) {
+      if (this.fragmentOpcode) {
+        this.close(1002, "Invalid fragmentation");
+        return;
+      }
       this.fragments = [payload];
       this.fragmentOpcode = opcode;
+      this.fragmentBytes = payload.length;
+      this.fragmentCount = 1;
+      if (!fin) {
+        this.fragmentTimer = setTimeout(() => this.close(1002, "Fragment timeout"), FRAGMENT_TIMEOUT_MS);
+      }
+      if (this.fragmentBytes > MAX_MESSAGE) {
+        this.close(1009, "Message too large");
+        return;
+      }
       if (fin) this.emitMessage();
       return;
     }
 
     if (opcode === 0x0) {
-      if (this.fragmentOpcode) {
-        this.fragments.push(payload);
-        if (fin) this.emitMessage();
+      if (!this.fragmentOpcode) {
+        this.close(1002, "Unexpected continuation");
+        return;
       }
+      this.fragmentBytes += payload.length;
+      this.fragmentCount += 1;
+      if (this.fragmentBytes > MAX_MESSAGE || this.fragmentCount > MAX_FRAGMENTS) {
+        this.close(1009, "Message too large");
+        return;
+      }
+      this.fragments.push(payload);
+      if (fin) this.emitMessage();
+      return;
     }
+    this.close(1002, "Unsupported frame");
   }
 
   emitMessage() {
@@ -401,6 +454,10 @@ class RelaySocket {
     const opcode = this.fragmentOpcode;
     this.fragments = [];
     this.fragmentOpcode = 0;
+    this.fragmentBytes = 0;
+    this.fragmentCount = 0;
+    if (this.fragmentTimer) clearTimeout(this.fragmentTimer);
+    this.fragmentTimer = null;
     if (opcode === 0x1) {
       this.handlers.onMessage(payload.toString("utf8"));
     }
@@ -437,6 +494,8 @@ class RelaySocket {
   finish(code, reason) {
     if (this.closed) return;
     this.closed = true;
+    if (this.fragmentTimer) clearTimeout(this.fragmentTimer);
+    this.fragments = [];
     try {
       this.socket.destroy();
     } catch {

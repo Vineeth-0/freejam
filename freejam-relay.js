@@ -37,6 +37,14 @@ const MAX_PAYLOAD = 64 * 1024;
 const MAX_BUFFER = 256 * 1024;
 const MAX_MESSAGES_PER_SECOND = 40;
 const MAX_CLIENTS_PER_ROOM = 32;
+const MAX_CONNECTIONS = 1000;
+const MAX_CONNECTIONS_PER_SOURCE = 100;
+const MAX_ROOMS = 10000;
+const MAX_INCOMPLETE_FRAMES = 128;
+const INCOMPLETE_MESSAGE_TIMEOUT_MS = 15000;
+const MAX_SOCKET_QUEUE = 1024 * 1024;
+const MAX_FRAMES_PER_SECOND = 240;
+const MAX_MAILBOXES_PER_SOURCE = 100;
 const MAX_MAILBOX_CLIENTS = 8;
 const MAX_MAILBOXES = 10000;
 const MAX_JAM_AGE_MS = 12 * 60 * 60 * 1000;
@@ -45,6 +53,9 @@ const MAX_WATCHED_USERS = 200;
 
 /** @type {Map<string, {key: string, clients: Set<Client>}>} */
 const rooms = new Map();
+const clients = new Set();
+const connectionsBySource = new Map();
+const mailboxRegistrations = new Map();
 
 /**
  * Each user has a mailbox keyed by a stable user id. Friends send jam invites
@@ -61,6 +72,24 @@ const mailboxes = new Map();
  * @type {Map<string, Array<{sk: string, jam: object, at: number, notifiedAt: number}>>}
  */
 const pendingJams = new Map();
+
+function allowMailboxAllocation(source) {
+  const now = Date.now();
+  let budget = mailboxRegistrations.get(source);
+  if (!budget && mailboxRegistrations.size >= 10000) {
+    for (const [address, entry] of mailboxRegistrations) {
+      if (now - entry.startedAt >= 60 * 60 * 1000) mailboxRegistrations.delete(address);
+    }
+    if (mailboxRegistrations.size >= 10000) return false;
+  }
+  if (!budget || now - budget.startedAt >= 60 * 60 * 1000) {
+    budget = { startedAt: now, count: 0 };
+    mailboxRegistrations.set(source, budget);
+  }
+  if (budget.count >= MAX_MAILBOXES_PER_SOURCE) return false;
+  budget.count += 1;
+  return true;
+}
 
 class Client {
   constructor(socket, room, session, key, id, name, role) {
@@ -79,6 +108,12 @@ class Client {
     this.watching = new Set();
     this.buffer = Buffer.alloc(0);
     this.fragments = [];
+    this.fragmentBytes = 0;
+    this.fragmentCount = 0;
+    this.fragmentStartedAt = 0;
+    this.fragmentTimer = null;
+    this.frameWindowStart = Date.now();
+    this.frameCount = 0;
     this.closed = false;
     this.msgWindowStart = Date.now();
     this.msgCount = 0;
@@ -86,6 +121,10 @@ class Client {
 
   send(message) {
     if (this.closed) return;
+    if (this.socket.writableLength > MAX_SOCKET_QUEUE) {
+      this.close(4008, "Slow connection");
+      return;
+    }
     const payload = Buffer.from(JSON.stringify(message), "utf8");
     this.socket.write(encodeFrame(0x1, payload));
   }
@@ -136,6 +175,7 @@ function decodeFrames(buffer, onFrame) {
     const fin = (b1 & 0x80) !== 0;
     const opcode = b1 & 0x0f;
     const masked = (b2 & 0x80) !== 0;
+    if ((b1 & 0x70) !== 0 || !masked) return { buffer: Buffer.alloc(0), error: "Protocol error: invalid frame" };
     let length = b2 & 0x7f;
     let headerLength = 2;
 
@@ -156,6 +196,8 @@ function decodeFrames(buffer, onFrame) {
     if (length > MAX_PAYLOAD) {
       return { buffer: Buffer.alloc(0), error: "Frame too large" };
     }
+    if ((opcode & 0x08) && (!fin || length > 125)) return { buffer: Buffer.alloc(0), error: "Protocol error: invalid control frame" };
+    if (![0x0, 0x1, 0x2, 0x8, 0x9, 0xa].includes(opcode)) return { buffer: Buffer.alloc(0), error: "Protocol error: unsupported opcode" };
 
     let maskKey = null;
     if (masked) {
@@ -357,7 +399,7 @@ function handleMailboxMessage(client, message) {
 
     let target = mailboxes.get(to);
     if (!target) {
-      if (mailboxes.size >= MAX_MAILBOXES) return;
+      if (mailboxes.size >= MAX_MAILBOXES || !allowMailboxAllocation(client.sourceAddress || "unknown")) return;
       target = { recvKey: "", sendKey: "", clients: new Set(), lastJam: null };
       mailboxes.set(to, target);
     }
@@ -569,6 +611,7 @@ server.on("upgrade", (req, socket) => {
   const userId = safeString(url.searchParams.get("user"), 128);
   const uid = safeString(url.searchParams.get("uid"), 128);
   const roomKey = safeString(url.searchParams.get("key"), 256);
+  const hostKey = safeString(url.searchParams.get("hostKey"), 256);
   const id = safeString(url.searchParams.get("id"), 64) || crypto.randomBytes(8).toString("hex");
   const name = safeString(url.searchParams.get("name"), 64) || "Listener";
   const isMailbox = Boolean(userId);
@@ -579,6 +622,29 @@ server.on("upgrade", (req, socket) => {
     socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
     socket.destroy();
     return;
+  }
+  if (clients.size >= MAX_CONNECTIONS) {
+    socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+  const sourceAddress = socket.remoteAddress || "unknown";
+  if ((connectionsBySource.get(sourceAddress) || 0) >= MAX_CONNECTIONS_PER_SOURCE) {
+    socket.write("HTTP/1.1 429 Too Many Requests\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+  if (isMailbox && !mailboxes.has(userId)) {
+    if (mailboxes.size >= MAX_MAILBOXES) {
+      socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    if (!allowMailboxAllocation(sourceAddress)) {
+      socket.write("HTTP/1.1 429 Too Many Requests\r\n\r\n");
+      socket.destroy();
+      return;
+    }
   }
 
   const accept = crypto
@@ -609,19 +675,6 @@ server.on("upgrade", (req, socket) => {
 
     let box = mailboxes.get(userId);
     if (!box) {
-      if (mailboxes.size >= MAX_MAILBOXES) {
-        const reject = new Client(
-          socket,
-          null,
-          sessionLabel,
-          roomKey,
-          id,
-          name,
-          role
-        );
-        reject.close(4009, "Relay is at capacity");
-        return;
-      }
       box = { recvKey: roomKey, sendKey: "", clients: new Set(), lastJam: null };
       mailboxes.set(userId, box);
     } else if (box.recvKey !== roomKey) {
@@ -687,20 +740,29 @@ server.on("upgrade", (req, socket) => {
         reject.close(4004, "Session not found");
         return;
       }
-      room = { key: roomKey, clients: new Set() };
+      if (!hostKey || hostKey.length < 32) {
+        const reject = new Client(socket, room, session, roomKey, id, name, role);
+        reject.close(4003, "Host credential required");
+        return;
+      }
+      if (rooms.size >= MAX_ROOMS) {
+        const reject = new Client(socket, room, session, roomKey, id, name, role);
+        reject.close(4009, "Relay is at capacity");
+        return;
+      }
+      room = { key: roomKey, hostKey, clients: new Set() };
       rooms.set(session, room);
-    } else if (room.key !== roomKey) {
+    } else if ((role === "host" && room.hostKey !== hostKey) || (role !== "host" && room.key !== roomKey)) {
       const reject = new Client(socket, room, session, roomKey, id, name, role);
       reject.close(4003, "Invalid session key");
       return;
-    } else if (role !== "host" && room.clients.size >= MAX_CLIENTS_PER_ROOM) {
+    } else if (room.clients.size >= MAX_CLIENTS_PER_ROOM && !(role === "host" && Array.from(room.clients).some((other) => other.role === "host"))) {
       const reject = new Client(socket, room, session, roomKey, id, name, role);
       reject.close(4009, "Session is full");
       return;
     }
 
-    // A reconnecting host replaces the previous host socket. The session key
-    // proves it is the same host, so this is safe.
+    // Only the separate host credential may replace the host connection.
     if (role === "host") {
       for (const other of room.clients) {
         if (other.role === "host" && other.id !== id) {
@@ -725,21 +787,35 @@ server.on("upgrade", (req, socket) => {
 
   socket.on("data", (chunk) => {
     if (client.closed) return;
-
-    client.buffer = Buffer.concat([client.buffer, chunk]);
-    if (client.buffer.length > MAX_BUFFER) {
+    if (client.buffer.length + chunk.length > MAX_BUFFER) {
       client.close(1009, "Buffer overflow");
       return;
     }
+    client.buffer = Buffer.concat([client.buffer, chunk]);
 
     const result = decodeFrames(
       client.buffer,
       (opcode, fin, payload) => {
+        if (client.closed) return;
+        const now = Date.now();
+        if (now - client.frameWindowStart > 1000) {
+          client.frameWindowStart = now;
+          client.frameCount = 0;
+        }
+        client.frameCount += 1;
+        if (client.frameCount > MAX_FRAMES_PER_SECOND) {
+          client.close(4008, "Frame rate exceeded");
+          return;
+        }
         if (opcode === 0x8) {
           client.close(1000, "");
           return;
         }
         if (opcode === 0x9) {
+          if (socket.writableLength > MAX_SOCKET_QUEUE) {
+            client.close(4008, "Slow connection");
+            return;
+          }
           socket.write(encodeFrame(0xa, payload));
           return;
         }
@@ -747,25 +823,49 @@ server.on("upgrade", (req, socket) => {
           return;
         }
         if (opcode === 0x1 || opcode === 0x0) {
+          if ((opcode === 0x0 && client.fragments.length === 0) || (opcode === 0x1 && client.fragments.length !== 0)) {
+            client.close(1002, "Invalid fragmentation");
+            return;
+          }
+          if (client.fragments.length === 0) {
+            client.fragmentStartedAt = now;
+            if (!fin) client.fragmentTimer = setTimeout(() => client.close(1002, "Fragment timeout"), INCOMPLETE_MESSAGE_TIMEOUT_MS);
+          }
+          client.fragmentBytes += payload.length;
+          client.fragmentCount += 1;
+          if (client.fragmentBytes > MAX_PAYLOAD || client.fragmentCount > MAX_INCOMPLETE_FRAMES || Date.now() - client.fragmentStartedAt > INCOMPLETE_MESSAGE_TIMEOUT_MS) {
+            client.close(1009, "Message too large or incomplete");
+            return;
+          }
           client.fragments.push(Buffer.from(payload));
           if (fin) {
             const raw = Buffer.concat(client.fragments);
             client.fragments = [];
+            client.fragmentBytes = 0;
+            client.fragmentCount = 0;
+            if (client.fragmentTimer) clearTimeout(client.fragmentTimer);
+            client.fragmentTimer = null;
             handleMessage(client, raw);
           }
         }
+        if (opcode === 0x2) client.close(1003, "Text messages required");
       }
     );
 
     client.buffer = result.buffer;
 
     if (result.error) {
-      client.close(1009, result.error);
+      client.close(result.error.startsWith("Protocol error") ? 1002 : 1009, result.error);
     }
   });
 
   const cleanup = () => {
     if (!container.clients.has(client)) return;
+    clients.delete(client);
+    const sourceCount = (connectionsBySource.get(client.sourceAddress) || 1) - 1;
+    if (sourceCount > 0) connectionsBySource.set(client.sourceAddress, sourceCount);
+    else connectionsBySource.delete(client.sourceAddress);
+    if (client.fragmentTimer) clearTimeout(client.fragmentTimer);
     container.clients.delete(client);
     client.closed = true;
 
@@ -786,6 +886,10 @@ server.on("upgrade", (req, socket) => {
   socket.on("close", cleanup);
   socket.on("end", cleanup);
   socket.on("error", cleanup);
+  clients.add(client);
+  client.sourceAddress = sourceAddress;
+  connectionsBySource.set(sourceAddress, (connectionsBySource.get(sourceAddress) || 0) + 1);
+  socket.setTimeout(60000, () => client.close(1001, "Idle timeout"));
 });
 
 server.listen(PORT, HOST, () => {

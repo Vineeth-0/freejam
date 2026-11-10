@@ -87,6 +87,7 @@
     relayUrl: "",
     sessionId: "",
     key: "",
+    hostKey: "",
     name: "",
     selfId: "",
     ws: null,
@@ -351,7 +352,9 @@
         sync.relayUrl = config.relayUrl;
         sync.sessionId = config.sessionId;
         sync.key = config.key;
+        sync.hostKey = config.hostKey || (config.role === "host" ? randomId(32) : "");
         sync.name = config.name || "";
+        if (config.role === "host" && !config.hostKey) saveState();
       }
     } catch (err) {
       console.warn("[FreeJam] Could not load saved session", err);
@@ -366,6 +369,7 @@
             relayUrl: sync.relayUrl,
             sessionId: sync.sessionId,
             key: sync.key,
+            hostKey: sync.role === "host" ? sync.hostKey : "",
             name: sync.name,
           }
         : null;
@@ -748,6 +752,7 @@
       url = new URL(sync.relayUrl);
       url.searchParams.set("session", sync.sessionId);
       url.searchParams.set("key", sync.key);
+      if (sync.role === "host") url.searchParams.set("hostKey", sync.hostKey);
       url.searchParams.set("id", sync.selfId);
       url.searchParams.set(
         "name",
@@ -1465,6 +1470,7 @@
     sync.relayUrl = "";
     sync.sessionId = "";
     sync.key = "";
+    sync.hostKey = "";
     sync.name = "";
     sync.error = null;
     sync.latencyMs = 0;
@@ -3522,6 +3528,7 @@
           sync.relayUrl = relayUrl;
           sync.sessionId = randomId(16);
           sync.key = randomId(16);
+          sync.hostKey = randomId(32);
           sync.name = (nameInput && nameInput.value.trim()) || "Host";
           sync.error = null;
           sync.reconnectDelay = 1000;

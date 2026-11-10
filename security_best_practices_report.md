@@ -13,6 +13,36 @@ release packaging. Some limitations are already disclosed in README.md; disclosu
 does not remove their impact. A small, trusted private group has a narrower threat
 model than an internet-accessible relay.
 
+## Remediation status
+
+The following fixes have since been applied locally on `main` after this audit:
+
+- Finding 1: host reconnects now require a separate 256-bit host credential that
+  is stored only in the host's local configuration; FJ1 guest codes still carry
+  only the guest session key.
+- Finding 2: relay and notifier parsing now cap aggregate message bytes and
+  fragments, time out incomplete messages, validate masking/control/fragment
+  rules, reject unsupported frames, and rate-limit frames. Relay clients also
+  have bounded idle time and outbound queues.
+- Finding 4: global and per-source live connection limits, room/mailbox caps,
+  per-source mailbox allocation budgets, idle timeouts and outbound queue limits
+  now bound resource use. This does not replace deployment-level firewall and
+  process limits.
+- Finding 5: Docker now uses Node 24 Alpine and runs as an unprivileged user;
+  the package engine and README require Node 24 or newer.
+- Findings 6 and 7: bundle inputs now come from tracked files, secret-like
+  configuration paths are excluded, the source archive is checked for unsafe
+  paths and common credential patterns, notifier bundles use the same
+  tracked-file allowlist, and the missing `render.yaml` reference is removed.
+
+Finding 3 remains unresolved: preventing first-owner mailbox squatting requires
+binding a stable mailbox ID to cryptographic ownership and migrating existing
+friend identities. A random registration secret alone cannot prove first
+ownership. Existing relay rooms also need a relay restart when deploying the
+host-credential change, because rooms created by the old relay have no host-only
+credential. The package build and archive path inspection succeeded locally;
+phone behavior, live relay behavior and Spotify playback remain unverified.
+
 ## Scope and method
 
 - Reviewed extension, custom Node HTTP/WebSocket relay, notifier, installers,

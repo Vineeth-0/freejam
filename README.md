@@ -216,7 +216,7 @@ and keys come from, how to host it, and how to operate it.
 
 It has **no npm dependencies**. It implements the HTTP upgrade handshake and
 WebSocket framing itself using only Node's built-in `http`, `crypto` and `os`
-modules. Node 18 or newer is enough.
+modules. Use a supported Node.js 24 LTS runtime.
 
 It is not a Spotify service, not a proxy, and not a bot. It never talks to
 Spotify. It is a message switchboard that the FreeJam extension connects to.
