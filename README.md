@@ -4,27 +4,19 @@ A Spicetify extension that gives free Spotify accounts a Jam-style shared
 listening session without calling Spotify's Premium-only Jam endpoints and
 without bypassing any paywall.
 
-FreeJam has three parts:
+FreeJam has two parts:
 
-| Part | Guests need FreeJam? | What it does |
-| --- | --- | --- |
-| **Request mode** | No | A normal collaborative playlist acts as a request inbox. New songs guests add are queued on the host's device. |
-| **Sync mode** | Yes | Host-authoritative playback sync over a small relay. Skips, seeks and play/pause from any participant are applied for everyone. |
-| **Friends** | Yes | A private native desktop alert (plus a short ding) when someone you added starts a jam. Only added friends can reach your mailbox; nothing is broadcast to everyone. |
+| Part | What it does |
+| --- | --- |
+| **Sync mode** | Host-authoritative playback sync over a small relay. Skips, seeks and play/pause from any participant are applied for everyone. |
+| **Friends** | A private native desktop alert (plus a short ding) when someone you added starts a jam. Only added friends can reach your mailbox; nothing is broadcast to everyone. |
 
-Both playback modes work on free accounts. FreeJam is a cooperative third-party
+Playback sync works on free accounts. FreeJam is a cooperative third-party
 player, not Spotify Jam.
 
 ---
 
 ## Quick start
-
-### "I just want friends to add songs" (request mode)
-
-1. Install the extension (below).
-2. Open FreeJam → type a name → **Start session**.
-3. Send the copied Spotify playlist invite link.
-4. Friends open it in Spotify and add songs. No install, no relay.
 
 ### "I want everyone on the same playhead" (sync mode)
 
@@ -50,7 +42,7 @@ player, not Spotify Jam.
 | `scripts/sync-to-spicetify.ps1` | Copies the extension into Spicetify and applies it. |
 | `scripts/install-git-hooks.ps1` | Installs the `post-merge` and `pre-push` hooks. |
 | `scripts/build-bundles.ps1` | Rebuilds the release zip files into `dist/`. |
-| `hooks/post-merge` | After `git pull`, updates the extension and optionally deploys the relay. |
+| `hooks/post-merge` | After `git pull`, updates the extension and reminds you to restart your relay. |
 | `hooks/pre-push` | Before `git push`, updates the extension if it changed. |
 | `README.md` | This file: install, usage, deployment and the full relay guide. |
 | `freejam-relay.service` | systemd unit for the relay. |
@@ -90,10 +82,10 @@ fully closed. The full guide is this README; the bundle includes a copy of it as
 ### Panel layout
 
 The panel is built from collapsible sections. Open **Settings → Panel sections**
-to hide anything you do not use: the **Session card**, **Playback sync**,
-**Friends**, **Recent requests**, or the help text. **Compact** keeps only the
-session and friends cards; **Show all** restores everything. Settings always
-stays visible so a hidden section can be brought back.
+to hide anything you do not use: **Playback sync**, **Friends**, or the help
+text. **Compact** keeps the sync and friends cards and hides the rest; **Show
+all** restores everything. Settings always stays visible so a hidden section can
+be brought back.
 
 ---
 
@@ -137,50 +129,6 @@ $env:FREEJAM_DRY_RUN = "1"
 git pull
 ```
 
-
-## Request mode (no guest install)
-
-Best when your friends just want to add songs and do not want to install
-anything.
-
-### Host
-
-1. Open the FreeJam panel.
-2. Type a session name and click **Start session**.
-   - FreeJam creates a private collaborative playlist.
-   - It asks Spotify for a normal "Invite collaborators" link and copies it.
-3. Send the invite link to your friends.
-   - The link looks like
-     `https://open.spotify.com/playlist/<id>?pt=<token>` and is valid for
-     7 days.
-   - If the automatic link fails, open the playlist, use **Invite
-     collaborators**, and paste the resulting link into **Paste an invite
-     link** → **Save link**.
-4. Keep the panel open (or Spotify running). FreeJam polls the playlist every
-   few seconds and queues anything new.
-
-You can also click **Use playlist** and paste an existing playlist link.
-FreeJam snapshots its current contents, so only songs added after that are
-queued.
-
-### Guest
-
-1. Open the invite link in the normal Spotify app.
-2. Accept the collaborator invite.
-3. Add songs to the playlist as usual.
-
-Each new song is queued on the host's device with a notification.
-
-### Notes
-
-- Request mode is one-way: guests choose *what* plays next, the host's player
-  is still the one that plays it.
-- The playlist is private; only people with the invite link can contribute.
-- Invite links expire after 7 days. Use **New invite link** to mint another.
-- The relay is not needed for request-mode playback. It is only needed if you
-  also want friend jam alerts.
-
----
 
 ## Sync mode (FreeJam on every device)
 
@@ -504,9 +452,7 @@ alerts.
     "mode": "sync",
     "hostName": "Alice",
     "joinCode": "FJ1...",
-    "sessionId": "...",
-    "inviteUrl": "",
-    "expiresAt": 0
+    "sessionId": "..."
   }
 }
 
@@ -521,9 +467,7 @@ alerts.
 { "t": "jam-clear", "from": "<senderUserId>" }
 ```
 
-A request-mode jam uses `"mode": "request"`, an `inviteUrl`, and an
-`expiresAt`. A sync jam uses `"mode": "sync"` with a `joinCode` and
-`sessionId`.
+A jam uses `"mode": "sync"` with a `joinCode` and `sessionId`.
 
 ### 5.5 Close codes
 
@@ -1096,12 +1040,11 @@ Repeat step 5 for each friend. When they add your code too, the card shows
 
 ### Getting alerts
 
-- Start a sync session or a request session. FreeJam automatically sends a
-  private jam alert to the friends in your list.
+- Start a sync session. FreeJam automatically sends a private jam alert to the
+  friends in your list.
 - You can also click **Send to friends** on an active session.
 - The friend sees a notification and a **Join jam** button in their Friends
-  card. **Join jam** joins the sync session, or opens/copies the request
-  playlist invite link.
+  card. **Join jam** joins the sync session.
 - If the friend is offline, the invite is delivered the next time they open
   Spotify (for up to 12 hours, unless the relay restarted).
 
@@ -1241,7 +1184,7 @@ in-app messages for you. Instead, **Copy invite message** puts a ready-to-paste
 message on your clipboard containing:
 
 - what the jam is,
-- the `FJ1` join code or playlist invite link, and
+- the `FJ1` join code, and
 - your `FJF1` friend code.
 
 Paste that into a Spotify playlist comment, Discord, WhatsApp, SMS, or anywhere
@@ -1313,7 +1256,6 @@ It contains the send key, never the receive key.
 
 - Sync mode requires FreeJam on every participant. There is no way to make a
   free account follow another device's playhead using Spotify's own APIs.
-- Request mode only queues songs; it does not sync playback.
 - Native seeks are detected by comparing the playhead against the expected
   position every 500 ms. Very small seeks may be corrected by the host's next
   state broadcast; use the FreeJam slider for precise seeks.
@@ -1335,12 +1277,10 @@ It contains the send key, never the receive key.
 | Symptom | Fix |
 | --- | --- |
 | No FreeJam button | Confirm `extensions = freejam.js` in `config-xpui.ini`, run `spicetify apply`, restart Spotify. |
-| Invite link not created | Open the playlist → **Invite collaborators**, then paste the link into the panel. |
 | Guest stuck on "Waiting for the host" | The host is not connected yet, or is using a different session id. Re-send the join code. |
 | "The session key is wrong" | The join code was truncated or belongs to another session. |
 | "Could not open the relay connection" | Check the relay URL, port, firewall, and whether the relay is running. |
 | Sync drifts | Click **Resync**; check the latency shown in the status line. |
-| Nothing queues in request mode | Keep Spotify open on the host, confirm the invite link is saved, and click **Check now**. |
 | Friend stays offline | Both devices must use the same relay URL, and the relay must be running the current `freejam-relay.js`. |
 | No jam alert from a friend | Add each other's `FJF1` codes, then start or resend the jam with **Send to friends**. |
 | "Different relay" warning | You and that friend created codes on different relays. Use the same relay and re-share the friend code. |
@@ -1365,6 +1305,5 @@ node --check notifier/freejam-notifier.js
 ```
 
 The relay has no dependencies. The extension expects the Spicetify global
-(`Spicetify.Player`, `Spicetify.Platform.PlaylistAPI`,
-`Spicetify.Platform.PlaylistPermissionsAPI`, `Spicetify.Playbar`,
-`Spicetify.PopupModal`, `Spicetify.LocalStorage`).
+(`Spicetify.Player`, `Spicetify.Playbar`, `Spicetify.PopupModal`,
+`Spicetify.LocalStorage`).

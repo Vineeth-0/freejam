@@ -198,14 +198,18 @@ function broadcastPresence(room) {
     uid: client.uid || "",
   }));
 
-  const message = {
-    t: "presence",
-    count: members.length,
-    members,
-  };
+  // The stable user id is the address of a friend mailbox, so a guest must not
+  // learn it for everyone else in the room: knowing an id is enough to try to
+  // pre-claim that mailbox. The host keeps the ids because it is the one that
+  // matches guests against its own friend list (to kick a friend by name).
+  const publicMembers = members.map(({ uid, ...rest }) => rest);
 
   for (const client of room.clients) {
-    client.send(message);
+    client.send({
+      t: "presence",
+      count: members.length,
+      members: client.role === "host" ? members : publicMembers,
+    });
   }
 }
 
@@ -232,30 +236,20 @@ function notifyWatchers(userId) {
 
 function buildJam(raw, client) {
   if (!raw || typeof raw !== "object") return null;
+  if (raw.mode !== "sync") return null;
 
-  const now = Date.now();
-  const mode = raw.mode === "request" ? "request" : "sync";
   const jam = {
     t: "jam",
-    mode,
+    mode: "sync",
     hostName: safeString(raw.hostName, 64) || client.name,
-    joinCode: mode === "sync" ? safeString(raw.joinCode, 4096) : "",
-    sessionId: mode === "sync" ? safeString(raw.sessionId, 128) : "",
-    inviteUrl: mode === "request" ? safeString(raw.inviteUrl, 2048) : "",
-    expiresAt:
-      mode === "request"
-        ? Math.min(
-            Number(raw.expiresAt) || now + MAX_JAM_AGE_MS,
-            now + MAX_JAM_AGE_MS
-          )
-        : 0,
-    at: now,
+    joinCode: safeString(raw.joinCode, 4096),
+    sessionId: safeString(raw.sessionId, 128),
+    at: Date.now(),
     from: client.userId,
     fromName: client.name,
   };
 
-  if (mode === "sync" && (!jam.joinCode || !jam.sessionId)) return null;
-  if (mode === "request" && !jam.inviteUrl) return null;
+  if (!jam.joinCode || !jam.sessionId) return null;
   return jam;
 }
 
@@ -290,13 +284,6 @@ function deliverPending(client) {
     // A pending invite is only valid if it was sent with the mailbox's current
     // send key. This drops anything queued by someone who guessed the user id.
     if (box.sendKey && entry.sk !== box.sendKey) continue;
-    if (
-      entry.jam.mode === "request" &&
-      entry.jam.expiresAt &&
-      entry.jam.expiresAt <= now
-    ) {
-      continue;
-    }
 
     if (isNotifier) {
       // A notifier may announce a pending jam while Spotify is closed, but it
@@ -622,24 +609,43 @@ server.on("upgrade", (req, socket) => {
 
     let box = mailboxes.get(userId);
     if (!box) {
+      if (mailboxes.size >= MAX_MAILBOXES) {
+        const reject = new Client(
+          socket,
+          null,
+          sessionLabel,
+          roomKey,
+          id,
+          name,
+          role
+        );
+        reject.close(4009, "Relay is at capacity");
+        return;
+      }
       box = { recvKey: roomKey, sendKey: "", clients: new Set(), lastJam: null };
       mailboxes.set(userId, box);
-    } else if (box.recvKey && box.recvKey !== roomKey) {
-      const reject = new Client(
-        socket,
-        box,
-        sessionLabel,
-        roomKey,
-        id,
-        name,
-        role
-      );
-      reject.close(4003, "Invalid mailbox key");
-      return;
-    } else if (!box.recvKey) {
-      // A placeholder created by an incoming DM. The owner is now claiming it.
-      box.recvKey = roomKey;
-    } else if (box.clients.size >= MAX_MAILBOX_CLIENTS) {
+    } else if (box.recvKey !== roomKey) {
+      // A mailbox may be reclaimed only while it is inert: no client connected
+      // and no owner ever completed hello. This stops a drive-by connection that
+      // merely guessed a user id from permanently poisoning that mailbox.
+      if (!box.recvKey || (box.clients.size === 0 && !box.sendKey)) {
+        box.recvKey = roomKey;
+      } else {
+        const reject = new Client(
+          socket,
+          box,
+          sessionLabel,
+          roomKey,
+          id,
+          name,
+          role
+        );
+        reject.close(4003, "Invalid mailbox key");
+        return;
+      }
+    }
+
+    if (box.clients.size >= MAX_MAILBOX_CLIENTS) {
       const reject = new Client(
         socket,
         box,
