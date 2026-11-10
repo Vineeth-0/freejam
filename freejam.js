@@ -1,19 +1,15 @@
 /*
  * FreeJam — collaborative listening for free Spotify accounts.
  *
- * Two independent modes:
+ * One mode: playback sync (FreeJam on every device).
  *
- * 1. Request mode (no guest install)
- *    FreeJam creates a normal private playlist and a regular "Invite
- *    collaborators" link. Guests open the link in the Spotify desktop/mobile
- *    app and add songs. This device watches the playlist and queues anything
- *    new. No Premium, no Jam API, no paywall bypass.
+ * A tiny relay (freejam-relay.js) connects the participants. The host is
+ * authoritative: their track, playhead, pause state and queue are broadcast
+ * to everyone. Skips, seeks, play/pause from any participant are forwarded
+ * to the host and then re-broadcast, so everyone stays together.
  *
- * 2. Sync mode (FreeJam on every device)
- *    A tiny relay (freejam-relay.js) connects the participants. The host is
- *    authoritative: their track, playhead, pause state and queue are broadcast
- *    to everyone. Skips, seeks, play/pause from any participant are forwarded
- *    to the host and then re-broadcast, so everyone stays together.
+ * Friends connect through the relay's mailboxes, so a jam invite only ever
+ * reaches people you added.
  *
  * Sync mode is a cooperative third-party player, not Spotify Jam. Free
  * accounts never call Spotify's Premium-only Jam endpoints.
@@ -27,14 +23,6 @@
   // ---------------------------------------------------------------------------
 
   const STORAGE_KEY = "freejam:session:v2";
-  const POLL_INTERVAL_MS = 4000;
-  const PAGE_SIZE = 100;
-  const MAX_QUEUE_PER_POLL = 25;
-  const MAX_HISTORY = 50;
-  const SNAPSHOT_CAP = 5000;
-  const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-  const ERROR_NOTIFY_COOLDOWN_MS = 2 * 60 * 1000;
-
   const SYNC_TICK_MS = 500;
   const SYNC_STATE_INTERVAL_MS = 2000;
   const SYNC_PING_INTERVAL_MS = 10000;
@@ -62,32 +50,14 @@
   function defaultState() {
     return {
       version: 2,
-      playlistUri: null,
-      playlistUrl: null,
-      inviteUrl: null,
-      inviteCreatedAt: null,
-      name: null,
-      startedAt: null,
-      lastTotal: 0,
-      paused: false,
-      pendingCount: 0,
-      requests: [],
-      processed: [],
-      lastError: null,
       lastRelayUrl: "",
       syncConfig: null,
     };
   }
 
   let state = defaultState();
-  let seen = new Set();
-  let sessionToken = 0;
-  let pollTimer = null;
-  let polling = false;
   let busy = false;
-  let endArmedUntil = 0;
   let syncLeaveArmedUntil = 0;
-  let lastErrorNotifyAt = 0;
   let audioContext = null;
 
   const alerts = {
@@ -98,10 +68,8 @@
   // Which parts of the panel are visible. Settings always stays visible so
   // people can bring back anything they hid.
   const DEFAULT_LAYOUT = {
-    session: true,
     sync: true,
     friends: true,
-    requests: true,
     hint: true,
   };
 
@@ -206,45 +174,6 @@
     });
   }
 
-  function playlistIdFromUri(uri) {
-    if (!uri) return null;
-    const match = String(uri).match(
-      /(?:spotify:playlist:|open\.spotify\.com\/playlist\/)([A-Za-z0-9]+)/
-    );
-    return match ? match[1] : null;
-  }
-
-  function playlistUrlFromUri(uri) {
-    const id = playlistIdFromUri(uri);
-    return id ? `https://open.spotify.com/playlist/${id}` : null;
-  }
-
-  function parsePlaylistInput(raw) {
-    if (!raw) return null;
-    const value = String(raw).trim();
-    if (/^spotify:playlist:[A-Za-z0-9]+$/.test(value)) return value;
-    const match = value.match(
-      /(?:open\.spotify\.com\/playlist\/|spotify:playlist:)([A-Za-z0-9]+)/
-    );
-    if (match) return `spotify:playlist:${match[1]}`;
-    if (/^[A-Za-z0-9]{22}$/.test(value)) return `spotify:playlist:${value}`;
-    return null;
-  }
-
-  function defaultSessionName() {
-    const now = new Date();
-    const date = [
-      now.getFullYear(),
-      String(now.getMonth() + 1).padStart(2, "0"),
-      String(now.getDate()).padStart(2, "0"),
-    ].join("-");
-    const time = [
-      String(now.getHours()).padStart(2, "0"),
-      String(now.getMinutes()).padStart(2, "0"),
-    ].join(":");
-    return `FreeJam · ${date} ${time}`;
-  }
-
   function timeAgo(timestamp) {
     const diff = Math.max(0, Date.now() - timestamp);
     const seconds = Math.floor(diff / 1000);
@@ -261,61 +190,6 @@
     const minutes = Math.floor(total / 60);
     const seconds = total % 60;
     return `${minutes}:${String(seconds).padStart(2, "0")}`;
-  }
-
-  function isQueueableItem(item) {
-    return Boolean(
-      item &&
-        item.uid &&
-        typeof item.uri === "string" &&
-        item.uri.startsWith("spotify:track:")
-    );
-  }
-
-  function addedAtMs(item) {
-    const value = item ? item.addedAt : null;
-    if (!value) return 0;
-    if (value instanceof Date) return value.getTime();
-    if (typeof value === "number") return value;
-    const parsed = Date.parse(value);
-    return Number.isFinite(parsed) ? parsed : 0;
-  }
-
-  function trackMeta(item) {
-    const artists = Array.isArray(item.artists)
-      ? item.artists
-          .map((artist) => (artist ? artist.name : null))
-          .filter(Boolean)
-          .join(", ")
-      : item.artist || "";
-
-    return {
-      uid: item.uid,
-      uri: item.uri,
-      name: item.name || "Unknown track",
-      artists,
-      addedBy:
-        (item.addedBy && (item.addedBy.displayName || item.addedBy.username)) ||
-        "someone",
-      addedAt: item.addedAt || null,
-      queuedAt: Date.now(),
-    };
-  }
-
-  function getNowPlaying() {
-    try {
-      const item = Spicetify.Player.data && Spicetify.Player.data.item;
-      if (!item || !item.name) return null;
-      const artists = Array.isArray(item.artists)
-        ? item.artists
-            .map((artist) => (artist ? artist.name : null))
-            .filter(Boolean)
-            .join(", ")
-        : item.artist || "";
-      return artists ? `${item.name} — ${artists}` : item.name;
-    } catch {
-      return null;
-    }
   }
 
   function randomId(bytes) {
@@ -457,19 +331,10 @@
       if (!raw) return;
       const parsed = JSON.parse(raw);
       if (!parsed || parsed.version !== 2) return;
-      if (
-        parsed.playlistUri &&
-        !/^spotify:playlist:[A-Za-z0-9]+$/.test(parsed.playlistUri)
-      ) {
-        return;
-      }
 
-      state = Object.assign(defaultState(), parsed);
-      if (!Array.isArray(state.requests)) state.requests = [];
-      if (!Array.isArray(state.processed)) state.processed = [];
-      state.lastError = null;
-      state.pendingCount = 0;
-      seen = new Set(state.processed);
+      state = defaultState();
+      state.lastRelayUrl =
+        typeof parsed.lastRelayUrl === "string" ? parsed.lastRelayUrl : "";
 
       const config = parsed.syncConfig;
       if (
@@ -495,7 +360,6 @@
 
   function saveState() {
     try {
-      state.processed = Array.from(seen);
       state.syncConfig = sync.role
         ? {
             role: sync.role,
@@ -807,10 +671,8 @@
   }
 
   function showJamAlert(jam) {
-    const what =
-      jam.mode === "sync" ? "a playback sync" : "a listening session";
     return showAlert(
-      `${jam.fromName || "A friend"} started ${what}`,
+      `${jam.fromName || "A friend"} started a playback sync`,
       "Open FreeJam to join.",
       {
         tag: `freejam-jam-${jam.from || "friend"}`,
@@ -822,75 +684,6 @@
   // ---------------------------------------------------------------------------
   // Spotify API wrappers
   // ---------------------------------------------------------------------------
-
-  async function fetchPage(uri, offset, limit) {
-    return Spicetify.Platform.PlaylistAPI.getContents(uri, { offset, limit });
-  }
-
-  async function fetchAllItems(uri, cap = SNAPSHOT_CAP) {
-    const items = [];
-    let offset = 0;
-    let total = 0;
-
-    while (offset < cap) {
-      const page = await fetchPage(uri, offset, PAGE_SIZE);
-      if (!page || !Array.isArray(page.items) || page.items.length === 0) {
-        if (page && Number.isFinite(page.totalLength)) total = page.totalLength;
-        break;
-      }
-      items.push(...page.items);
-      total = Number.isFinite(page.totalLength) ? page.totalLength : items.length;
-      offset += page.items.length;
-      if (offset >= total) break;
-    }
-
-    // If the playlist is huge and we stopped early, still snapshot the tail so
-    // polling can never mistake old songs for new requests.
-    if (offset < total && total > PAGE_SIZE) {
-      try {
-        const tail = await fetchPage(
-          uri,
-          Math.max(0, total - PAGE_SIZE),
-          PAGE_SIZE
-        );
-        if (tail && Array.isArray(tail.items)) items.push(...tail.items);
-      } catch (err) {
-        console.warn("[FreeJam] Could not snapshot the end of the playlist", err);
-      }
-    }
-
-    return { items, total };
-  }
-
-  async function createInvite(uri) {
-    const api = Spicetify.Platform.PlaylistPermissionsAPI;
-    if (!api || typeof api.getPermissionGrant !== "function") {
-      throw new Error(
-        "This Spotify version doesn't expose invite links. Use “Invite collaborators” in the playlist menu and paste the link in FreeJam."
-      );
-    }
-
-    const grant = await api.getPermissionGrant(uri, "CONTRIBUTOR");
-    const token = grant && grant.token;
-    if (!token) throw new Error("Spotify did not return an invite token.");
-
-    const base = playlistUrlFromUri(uri);
-    return {
-      token,
-      url: `${base}?pt=${encodeURIComponent(token)}`,
-    };
-  }
-
-  async function queueTrack(uri) {
-    if (typeof Spicetify.addToQueue !== "function") {
-      throw new Error("The queue API is not ready yet.");
-    }
-    const result = Spicetify.addToQueue([{ uri }]);
-    if (!result || typeof result.then !== "function") {
-      throw new Error("The queue is not available. Start playback, then retry.");
-    }
-    await result;
-  }
 
   async function copyText(text) {
     try {
@@ -926,393 +719,6 @@
       console.warn("[FreeJam] execCommand copy failed", err);
       return false;
     }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Request mode: polling
-  // ---------------------------------------------------------------------------
-
-  function schedulePoll(delay = POLL_INTERVAL_MS) {
-    clearTimeout(pollTimer);
-    pollTimer = null;
-    if (!state.playlistUri) return;
-    pollTimer = setTimeout(runPoll, delay);
-  }
-
-  function notifyError(message) {
-    if (Date.now() - lastErrorNotifyAt < ERROR_NOTIFY_COOLDOWN_MS) return;
-    lastErrorNotifyAt = Date.now();
-    Spicetify.showNotification(`FreeJam: ${message}`, true, 6000);
-  }
-
-  async function pollOnce() {
-    const token = sessionToken;
-    const uri = state.playlistUri;
-    if (!uri) return;
-
-    const top = await fetchPage(uri, 0, PAGE_SIZE);
-    if (token !== sessionToken || state.playlistUri !== uri) return;
-    if (!top || !Array.isArray(top.items)) {
-      throw new Error("Unexpected response while reading the request playlist.");
-    }
-
-    const total = Number.isFinite(top.totalLength)
-      ? top.totalLength
-      : top.items.length;
-
-    // Playlist order can be newest-first at the top and oldest-first at the
-    // bottom depending on how a guest added the song. Look at both ends.
-    let items = top.items.slice().reverse();
-    if (total > PAGE_SIZE) {
-      const tail = await fetchPage(
-        uri,
-        Math.max(PAGE_SIZE, total - PAGE_SIZE),
-        PAGE_SIZE
-      );
-      if (token !== sessionToken || state.playlistUri !== uri) return;
-      if (tail && Array.isArray(tail.items)) items = items.concat(tail.items);
-    }
-
-    let changed = false;
-    if (state.lastTotal !== total) {
-      state.lastTotal = total;
-      changed = true;
-    }
-
-    const fresh = [];
-    const freshUids = new Set();
-    for (const item of items) {
-      if (!isQueueableItem(item)) continue;
-      if (seen.has(item.uid) || freshUids.has(item.uid)) continue;
-      freshUids.add(item.uid);
-      fresh.push(item);
-    }
-
-    fresh.sort((a, b) => addedAtMs(a) - addedAtMs(b));
-
-    if (fresh.length === 0) {
-      if (state.pendingCount !== 0) {
-        state.pendingCount = 0;
-        changed = true;
-      }
-      if (state.lastError) {
-        state.lastError = null;
-        changed = true;
-      }
-      if (changed) {
-        saveState();
-        updateButton();
-        updatePanel();
-      }
-      return;
-    }
-
-    if (state.paused) {
-      if (state.pendingCount !== fresh.length) {
-        state.pendingCount = fresh.length;
-        changed = true;
-      }
-      if (state.lastError) {
-        state.lastError = null;
-        changed = true;
-      }
-      if (changed) {
-        saveState();
-        updatePanel();
-      }
-      return;
-    }
-
-    const batch = fresh.slice(0, MAX_QUEUE_PER_POLL);
-    const queued = [];
-
-    for (const item of batch) {
-      try {
-        await queueTrack(item.uri);
-      } catch (err) {
-        if (token !== sessionToken || state.playlistUri !== uri) return;
-        state.lastError =
-          (err && err.message) || "Could not add the request to the queue.";
-        notifyError(state.lastError);
-        break;
-      }
-
-      if (token !== sessionToken || state.playlistUri !== uri) return;
-
-      seen.add(item.uid);
-      const meta = trackMeta(item);
-      queued.push(meta);
-      state.requests.unshift(meta);
-      if (state.requests.length > MAX_HISTORY) {
-        state.requests.length = MAX_HISTORY;
-      }
-    }
-
-    state.pendingCount = Math.max(0, fresh.length - queued.length);
-    if (queued.length > 0) {
-      state.lastError = null;
-      notifyQueued(queued);
-    }
-
-    saveState();
-    updateButton();
-    updatePanel();
-  }
-
-  async function runPoll() {
-    if (!state.playlistUri) return;
-    if (polling) {
-      schedulePoll(1000);
-      return;
-    }
-
-    const token = sessionToken;
-    polling = true;
-    try {
-      await pollOnce();
-    } catch (err) {
-      if (token !== sessionToken) return;
-      state.lastError =
-        (err && err.message) || "Could not read the request playlist.";
-      notifyError(state.lastError);
-      updatePanel();
-      updateButton();
-    } finally {
-      polling = false;
-      schedulePoll();
-    }
-  }
-
-  function notifyQueued(batch) {
-    if (!batch.length) return;
-    if (batch.length === 1) {
-      const item = batch[0];
-      const by = item.addedBy ? ` · added by ${item.addedBy}` : "";
-      Spicetify.showNotification(`FreeJam queued “${item.name}”${by}`, false, 4000);
-    } else {
-      Spicetify.showNotification(
-        `FreeJam queued ${batch.length} new requests`,
-        false,
-        4000
-      );
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Request mode: lifecycle
-  // ---------------------------------------------------------------------------
-
-  async function createSession(name, existingUri = null, isAdoption = false) {
-    if (state.playlistUri) {
-      Spicetify.showNotification("A FreeJam session is already active.", true);
-      return;
-    }
-    if (busy) return;
-
-    busy = true;
-    sessionToken += 1;
-    try {
-      let sessionName = name || defaultSessionName();
-      let uri = existingUri;
-
-      if (uri) {
-        try {
-          const metadata = await Spicetify.Platform.PlaylistAPI.getMetadata(uri);
-          if (metadata && metadata.name) sessionName = metadata.name;
-        } catch (err) {
-          console.warn("[FreeJam] Could not read playlist metadata", err);
-        }
-      } else {
-        uri = await Spicetify.Platform.RootlistAPI.createPlaylist(
-          sessionName,
-          { before: "start" },
-          true
-        );
-        if (!uri) throw new Error("Spotify did not create the playlist.");
-
-        try {
-          await Spicetify.Platform.PlaylistAPI.updateDetails(uri, {
-            name: sessionName,
-            description:
-              "FreeJam request inbox — songs added here are queued on the host's device. Created with the FreeJam Spicetify extension.",
-          });
-        } catch (err) {
-          console.warn("[FreeJam] Could not set the playlist description", err);
-        }
-      }
-
-      let processed = new Set();
-      let total = 0;
-      if (isAdoption || existingUri) {
-        const snapshot = await fetchAllItems(uri);
-        processed = new Set(
-          snapshot.items.filter(isQueueableItem).map((item) => item.uid)
-        );
-        total = snapshot.total;
-      }
-
-      let invite = null;
-      try {
-        invite = await createInvite(uri);
-      } catch (err) {
-        console.warn("[FreeJam] Automatic invite link failed", err);
-      }
-
-      state = Object.assign(defaultState(), {
-        playlistUri: uri,
-        playlistUrl: playlistUrlFromUri(uri),
-        inviteUrl: invite ? invite.url : null,
-        inviteCreatedAt: invite ? Date.now() : null,
-        name: sessionName,
-        startedAt: Date.now(),
-        lastTotal: total,
-        lastRelayUrl: state.lastRelayUrl,
-        syncConfig: state.syncConfig,
-      });
-      seen = processed;
-
-      saveState();
-      updateButton();
-      updatePanel(true);
-      schedulePoll(600);
-
-      if (invite && invite.url) {
-        announceJam();
-        const copied = await copyText(invite.url);
-        Spicetify.showNotification(
-          copied
-            ? "FreeJam started. Invite link copied — send it to your friends."
-            : "FreeJam started. Copy the invite link from the FreeJam panel.",
-          false,
-          6000
-        );
-      } else {
-        Spicetify.showNotification(
-          "FreeJam started, but the invite link needs to be added manually in the panel.",
-          true,
-          8000
-        );
-      }
-    } finally {
-      busy = false;
-    }
-  }
-
-  function endSession() {
-    clearTimeout(pollTimer);
-    pollTimer = null;
-
-    const hadPlaylist = Boolean(state.playlistUrl);
-    const lastRelayUrl = state.lastRelayUrl;
-    if (hadPlaylist) clearFriendsJam();
-    sessionToken += 1;
-    state = defaultState();
-    state.lastRelayUrl = lastRelayUrl;
-    seen = new Set();
-    endArmedUntil = 0;
-
-    if (sync.role || state.lastRelayUrl) {
-      saveState();
-    } else {
-      try {
-        Spicetify.LocalStorage.remove(STORAGE_KEY);
-      } catch (err) {
-        console.warn("[FreeJam] Could not clear saved session", err);
-      }
-    }
-
-    updateButton();
-    updatePanel(true);
-    Spicetify.showNotification(
-      hadPlaylist
-        ? "FreeJam request session ended. The playlist was left in your library."
-        : "FreeJam request session ended.",
-      false,
-      5000
-    );
-  }
-
-  async function regenerateInvite() {
-    if (!state.playlistUri) return;
-    if (busy) return;
-
-    busy = true;
-    try {
-      const invite = await createInvite(state.playlistUri);
-      state.inviteUrl = invite.url;
-      state.inviteCreatedAt = Date.now();
-      saveState();
-      updatePanel(true);
-      announceJam();
-      Spicetify.showNotification("New invite link created (valid for 7 days).");
-    } finally {
-      busy = false;
-    }
-  }
-
-  function savePastedInvite() {
-    const input = $('[data-fj="pasteInvite"]', ui.root);
-    const value = input ? input.value.trim() : "";
-    if (!value) return;
-
-    if (!/^https?:\/\/open\.spotify\.com\/playlist\/[A-Za-z0-9]+/.test(value)) {
-      Spicetify.showNotification(
-        "That doesn't look like a Spotify playlist invite link.",
-        true
-      );
-      return;
-    }
-
-    state.inviteUrl = value;
-    state.inviteCreatedAt = null;
-    saveState();
-    updatePanel(true);
-    Spicetify.showNotification("Invite link saved.");
-  }
-
-  function inviteExpiryText() {
-    if (!state.inviteCreatedAt) return null;
-
-    const remaining = state.inviteCreatedAt + INVITE_TTL_MS - Date.now();
-    if (remaining <= 0) {
-      return {
-        warn: true,
-        text: "This invite link has expired. Create a new one.",
-      };
-    }
-
-    const days = Math.floor(remaining / 86400000);
-    const hours = Math.floor((remaining % 86400000) / 3600000);
-
-    if (remaining < 86400000) {
-      return {
-        warn: true,
-        text: `Invite expires in ${hours}h. Create a new one soon.`,
-      };
-    }
-    return { warn: false, text: `Invite expires in ${days}d ${hours}h.` };
-  }
-
-  function openPlaylist() {
-    if (!state.playlistUri) return;
-
-    const id = playlistIdFromUri(state.playlistUri);
-    try {
-      Spicetify.PopupModal.hide();
-    } catch {
-      /* ignore */
-    }
-
-    try {
-      if (Spicetify.Platform.History && Spicetify.Platform.History.push) {
-        Spicetify.Platform.History.push(`/playlist/${id}`);
-        return;
-      }
-    } catch (err) {
-      console.warn("[FreeJam] Could not navigate to the playlist", err);
-    }
-
-    if (state.playlistUrl) window.open(state.playlistUrl, "_blank");
   }
 
   // ---------------------------------------------------------------------------
@@ -2074,7 +1480,7 @@
     sync.lastCmdAt = 0;
     sync.reconnectDelay = 1000;
 
-    if (state.playlistUri || state.lastRelayUrl) {
+    if (state.lastRelayUrl) {
       saveState();
     } else {
       try {
@@ -2300,34 +1706,18 @@
   }
 
   function buildLocalJam() {
-    if (sync.role === "host" && sync.sessionId) {
-      return {
-        mode: "sync",
-        hostName: friendIdentityName(),
-        joinCode: encodeJoinCode({
-          relayUrl: sync.relayUrl,
-          sessionId: sync.sessionId,
-          key: sync.key,
-        }),
+    if (sync.role !== "host" || !sync.sessionId) return null;
+
+    return {
+      mode: "sync",
+      hostName: friendIdentityName(),
+      joinCode: encodeJoinCode({
+        relayUrl: sync.relayUrl,
         sessionId: sync.sessionId,
-        inviteUrl: "",
-        expiresAt: 0,
-      };
-    }
-
-    if (state.playlistUri && state.inviteUrl) {
-      return {
-        mode: "request",
-        hostName: friendIdentityName(),
-        joinCode: "",
-        sessionId: "",
-        inviteUrl: state.inviteUrl,
-        expiresAt:
-          (state.inviteCreatedAt || Date.now()) + INVITE_TTL_MS,
-      };
-    }
-
-    return null;
+        key: sync.key,
+      }),
+      sessionId: sync.sessionId,
+    };
   }
 
   function announceJam() {
@@ -2358,11 +1748,9 @@
   }
 
   function setIncomingJam(jam) {
+    if (!jam || typeof jam !== "object" || jam.mode !== "sync") return;
+
     friends.incomingJam = jam;
-    if (jam.mode === "request" && jam.expiresAt && jam.expiresAt <= Date.now()) {
-      friends.incomingJam = null;
-      return;
-    }
 
     if (
       !jam.suppressNotify &&
@@ -2453,57 +1841,35 @@
 
   function joinIncomingJam() {
     const jam = friends.incomingJam;
-    if (!jam) return;
+    if (!jam || jam.mode !== "sync") return;
 
-    if (jam.mode === "sync") {
-      if (sync.role === "host") {
-        Spicetify.showNotification(
-          "Leave your own sync session before joining a friend's.",
-          true
-        );
-        return;
-      }
-
-      const config = decodeJoinCode(jam.joinCode);
-      if (!config) {
-        Spicetify.showNotification("This jam invite is invalid or expired.", true);
-        return;
-      }
-
-      sync.role = "guest";
-      sync.relayUrl = normalizeRelayUrl(config.relayUrl);
-      sync.sessionId = config.sessionId;
-      sync.key = config.key;
-      sync.name = sync.name || friendIdentityName();
-      sync.error = null;
-      sync.reconnectDelay = 1000;
-      state.lastRelayUrl = sync.relayUrl;
-      saveState();
-      connectSync();
-      refreshPanelSections();
-      Spicetify.showNotification(`Joining ${jam.fromName || "your friend"}'s sync.`);
-      clearIncomingJam();
+    if (sync.role === "host") {
+      Spicetify.showNotification(
+        "Leave your own sync session before joining a friend's.",
+        true
+      );
       return;
     }
 
-    if (jam.mode === "request") {
-      if (!jam.inviteUrl) {
-        Spicetify.showNotification("This invite link is missing.", true);
-        return;
-      }
-      copyText(jam.inviteUrl);
-      try {
-        window.open(jam.inviteUrl, "_blank");
-      } catch {
-        /* ignore */
-      }
-      Spicetify.showNotification(
-        "Invite link copied and opened. Add songs from the Spotify app.",
-        false,
-        6000
-      );
-      clearIncomingJam();
+    const config = decodeJoinCode(jam.joinCode);
+    if (!config) {
+      Spicetify.showNotification("This jam invite is invalid or expired.", true);
+      return;
     }
+
+    sync.role = "guest";
+    sync.relayUrl = normalizeRelayUrl(config.relayUrl);
+    sync.sessionId = config.sessionId;
+    sync.key = config.key;
+    sync.name = sync.name || friendIdentityName();
+    sync.error = null;
+    sync.reconnectDelay = 1000;
+    state.lastRelayUrl = sync.relayUrl;
+    saveState();
+    connectSync();
+    refreshPanelSections();
+    Spicetify.showNotification(`Joining ${jam.fromName || "your friend"}'s sync.`);
+    clearIncomingJam();
   }
 
   function friendInviteMessage() {
@@ -2512,18 +1878,15 @@
     const jam = buildLocalJam();
     const lines = [];
 
-    if (jam && jam.mode === "sync") {
+    if (jam) {
       lines.push(`${friendIdentityName()} is hosting a FreeJam playback sync.`);
       lines.push(`Join code: ${jam.joinCode}`);
-    } else if (jam && jam.mode === "request") {
-      lines.push(`${friendIdentityName()} started a FreeJam listening session.`);
-      lines.push(`Add songs here: ${jam.inviteUrl}`);
     } else {
       lines.push(`${friendIdentityName()} invited you to FreeJam.`);
     }
 
     lines.push("");
-    lines.push(`Add me as a friend in FreeJam with this code:`);
+    lines.push("Add me as a friend in FreeJam with this code:");
     lines.push(code);
     return lines.join("\n");
   }
@@ -3014,111 +2377,10 @@
     document.head.appendChild(style);
   }
 
-  function buildStartForm() {
-    const wrap = el("div", "fj-card");
-    wrap.append(el("div", "fj-card-title", "Start a FreeJam session"));
-
-    const nameRow = el("div", "fj-row");
-    const nameInput = document.createElement("input");
-    nameInput.className = "fj-input";
-    nameInput.placeholder = "Session name";
-    nameInput.value = defaultSessionName();
-    nameInput.dataset.fj = "name";
-    const startButton = el("button", "fj-btn", "Start session");
-    startButton.dataset.action = "start";
-    nameRow.append(nameInput, startButton);
-    wrap.append(nameRow);
-
-    const adoptRow = el("div", "fj-row");
-    const adoptInput = document.createElement("input");
-    adoptInput.className = "fj-input";
-    adoptInput.placeholder = "…or paste an existing playlist link";
-    adoptInput.dataset.fj = "adopt";
-    const adoptButton = el("button", "fj-btn secondary", "Use playlist");
-    adoptButton.dataset.action = "adopt";
-    adoptRow.append(adoptInput, adoptButton);
-    wrap.append(adoptRow);
-
-    wrap.append(
-      el(
-        "div",
-        "fj-hint",
-        "Request sessions use a collaborative playlist as a shared inbox. Starting one creates it for you; guests add songs there and this device queues new additions. Use an existing playlist if you already have one. Playback sync is separate and does not need a playlist."
-      )
-    );
-
-    return wrap;
-  }
-
   function actionButton(action, label, variant) {
     const button = el("button", `fj-btn ${variant || ""}`.trim(), label);
     button.dataset.action = action;
     return button;
-  }
-
-  function buildSessionCard() {
-    const wrap = el("div", "fj-card");
-
-    const head = el("div", "fj-card-head");
-    head.append(el("div", "fj-card-title", state.name || "FreeJam session"));
-    const badge = el("span", "fj-badge", state.paused ? "Paused" : "Live");
-    if (state.paused) badge.classList.add("off");
-    head.append(badge);
-    wrap.append(head);
-
-    if (state.inviteUrl) {
-      const row = el("div", "fj-row");
-      const input = document.createElement("input");
-      input.className = "fj-input fj-mono";
-      input.readOnly = true;
-      input.value = state.inviteUrl;
-      input.dataset.fj = "invite";
-      input.addEventListener("focus", () => input.select());
-      const copyButton = el("button", "fj-btn", "Copy invite");
-      copyButton.dataset.action = "copy";
-      row.append(input, copyButton);
-      wrap.append(row);
-
-      const expiry = inviteExpiryText();
-      if (expiry) {
-        wrap.append(el("div", expiry.warn ? "fj-warn" : "fj-hint", expiry.text));
-      }
-    } else {
-      wrap.append(
-        el(
-          "div",
-          "fj-warn",
-          "Couldn't create an invite link automatically. Open the playlist, use “Invite collaborators”, then paste the link below."
-        )
-      );
-    }
-
-    const pasteRow = el("div", "fj-row");
-    const pasteInput = document.createElement("input");
-    pasteInput.className = "fj-input";
-    pasteInput.placeholder = "Paste an invite link (…?pt=…)";
-    pasteInput.dataset.fj = "pasteInvite";
-    const saveButton = el("button", "fj-btn secondary", "Save link");
-    saveButton.dataset.action = "saveInvite";
-    pasteRow.append(pasteInput, saveButton);
-    wrap.append(pasteRow);
-
-    const actions = el("div", "fj-actions");
-    actions.append(
-      actionButton("open", "Open playlist", "secondary"),
-      actionButton("regenerate", "New invite link", "secondary"),
-      actionButton("announceJam", "Invite all friends", "secondary"),
-      actionButton("retry", "Check now", "secondary"),
-      actionButton(
-        state.paused ? "resume" : "pause",
-        state.paused ? "Resume queue" : "Pause queue",
-        "secondary"
-      ),
-      actionButton("end", "End session", "danger")
-    );
-    wrap.append(actions);
-
-    return wrap;
   }
 
   function buildSyncSetupCard() {
@@ -3469,15 +2731,13 @@
       el(
         "div",
         "fj-hint",
-        "Hide the parts of the panel you do not use. Compact keeps the session and friends cards and hides the rest. Settings always stays visible."
+        "Hide the parts of the panel you do not use. Compact keeps the sync and friends cards and hides the rest. Settings always stays visible."
       )
     );
 
     const sections = [
-      ["session", "Session card", "Start a session or manage the active one."],
       ["sync", "Playback sync", "Relay setup for synced playback."],
       ["friends", "Friends", "Friend codes and your friend list."],
-      ["requests", "Recent requests", "The request inbox summary."],
       ["hint", "Help text", "The explanation at the bottom of the panel."],
     ];
 
@@ -3602,9 +2862,7 @@
         el(
           "div",
           "fj-item-name",
-          `${jam.fromName || "A friend"} · ${
-            jam.mode === "sync" ? "playback sync" : "listening session"
-          }`
+          `${jam.fromName || "A friend"} · playback sync`
         )
       );
       info.append(el("div", "fj-item-meta", timeAgo(jam.at || Date.now())));
@@ -3694,7 +2952,6 @@
       friends.incomingJam
         ? `${friends.incomingJam.from}|${friends.incomingJam.at}|${friends.incomingJam.mode}`
         : "",
-      state.playlistUri && state.inviteUrl ? "request-jam" : "",
       sync.role === "host" && sync.sessionId
         ? `host:${sync.sessionId}:${sync.members
             .map((member) => `${member.id}:${member.uid || ""}`)
@@ -3792,41 +3049,21 @@
     updatePanel();
   }
 
-  function buildRequestRow(item) {
-    const row = el("div", "fj-item");
-    const info = el("div", "fj-item-info");
-    info.append(el("div", "fj-item-name", item.name));
-
-    const meta = [];
-    if (item.artists) meta.push(item.artists);
-    if (item.addedBy) meta.push(`added by ${item.addedBy}`);
-    if (item.queuedAt) meta.push(timeAgo(item.queuedAt));
-
-    info.append(el("div", "fj-item-meta", meta.join(" · ")));
-    row.append(info);
-    return row;
-  }
-
   function updateButton() {
     if (!ui.button) return;
 
-    const active = Boolean(state.playlistUri || sync.role || friends.incomingJam);
-    ui.button.active = active;
+    ui.button.active = Boolean(sync.role || friends.incomingJam);
 
     if (friends.incomingJam) {
       ui.button.label = `FreeJam — join ${
         friends.incomingJam.fromName || "a friend"
       }'s jam`;
-    } else if (state.playlistUri) {
-      ui.button.label = `FreeJam — ${
-        state.paused ? "paused" : "listening"
-      }${state.requests.length ? ` (${state.requests.length})` : ""}`;
     } else if (sync.role) {
       ui.button.label = `FreeJam — ${
         sync.connected ? "synced" : "connecting"
       }`;
     } else {
-      ui.button.label = "FreeJam — start a session";
+      ui.button.label = "FreeJam — open";
     }
   }
 
@@ -3839,7 +3076,7 @@
     }
   }
 
-  function updatePanel(forceSessionRender = false) {
+  function updatePanel() {
     const root = ui.root;
     if (!root || !root.isConnected) {
       if (root && !root.isConnected) ui.root = null;
@@ -3847,13 +3084,9 @@
     }
 
     const status = $('[data-fj="status"]', root);
-    const session = $('[data-fj="session"]', root);
     const syncContainer = $('[data-fj="sync"]', root);
     const friendsContainer = $('[data-fj="friends"]', root);
     const settingsContainer = $('[data-fj="settings"]', root);
-    const count = $('[data-fj="count"]', root);
-    const now = $('[data-fj="now"]', root);
-    const list = $('[data-fj="requests"]', root);
     const hint = $('[data-fj="hint"]', root);
 
     if (status) {
@@ -3861,102 +3094,26 @@
       const dot = el("span", "fj-dot");
       let text;
 
-      if (!state.playlistUri && !sync.role) {
+      if (!sync.role) {
         dot.classList.add("off");
-        text = layout.session
-          ? "No active session. Start one below — no Premium needed."
-          : "No active session. Turn on Session card in Settings to start one.";
-      } else if (state.lastError) {
+        text = "No playback sync. Start one below — no Premium needed.";
+      } else if (!sync.connected) {
         dot.classList.add("off");
-        text = state.lastError;
-      } else if (!state.playlistUri) {
-        if (!sync.connected) dot.classList.add("off");
-        text = sync.connected
-          ? `Playback sync active · ${sync.members.length || 1} connected.`
-          : "Playback sync is connecting…";
-      } else if (state.paused) {
-        dot.classList.add("off");
-        text = `Queueing paused${
-          state.pendingCount ? ` · ${state.pendingCount} waiting` : ""
-        }.`;
+        text = "Playback sync is connecting…";
       } else {
-        text = `Listening for requests${
-          state.pendingCount ? ` · ${state.pendingCount} waiting` : ""
-        }.`;
+        text = `Playback sync active · ${sync.members.length || 1} connected.`;
       }
 
       status.append(dot, el("span", null, text));
-    }
-
-    if (session) {
-      const key = state.playlistUri
-        ? `session|${state.playlistUri}|${state.inviteUrl || ""}|${
-            state.paused
-          }|${state.name || ""}`
-        : "none";
-
-      if (forceSessionRender) session.dataset.renderKey = "";
-      if (session.dataset.renderKey !== key) {
-        session.dataset.renderKey = key;
-        session.replaceChildren(
-          state.playlistUri ? buildSessionCard() : buildStartForm()
-        );
-      }
     }
 
     if (syncContainer) renderSyncSection(syncContainer);
     if (friendsContainer) renderFriendsSection(friendsContainer);
     if (settingsContainer) renderSettingsSection(settingsContainer);
 
-    if (now) {
-      now.replaceChildren();
-      const playing = getNowPlaying();
-      if (playing) {
-        now.append(
-          el("span", "fj-muted", "Now playing: "),
-          el("span", "fj-now-name", playing)
-        );
-      }
-    }
-
-    if (count) {
-      count.textContent = state.requests.length
-        ? `${state.requests.length} queued`
-        : "";
-    }
-
-    if (list) {
-      const requestCard = list.closest(".fj-card");
-      if (requestCard) requestCard.style.display = state.requests.length ? "" : "none";
-      list.replaceChildren();
-      if (state.requests.length === 0) {
-        list.append(
-          el(
-            "div",
-            "fj-empty",
-            state.playlistUri
-              ? "Nothing yet. Share the invite link and requests will appear here."
-              : "Start a request session to see requests here."
-          )
-        );
-      } else {
-        for (const item of state.requests) {
-          list.append(buildRequestRow(item));
-        }
-      }
-    }
-
     if (hint) {
-      if (!state.playlistUri && sync.role) {
-        hint.textContent =
-          "Sync mode is active. Use Spotify's normal player controls to control playback. Start a request session only if you also want guests to add songs to a playlist.";
-      } else if (state.playlistUri) {
-        hint.textContent =
-          "Guests open the invite link in the Spotify desktop or mobile app, then add songs to the request playlist. This device queues them automatically. Invite links expire after 7 days.";
-      } else {
-        hint.textContent =
-          "Request sessions use a collaborative playlist as a shared inbox for song requests; FreeJam creates one automatically, or you can choose an existing playlist. Playback sync is a separate relay mode and does not need a playlist. Use Spotify's normal player controls.";
-      }
+      hint.textContent =
+        "Use Spotify's normal player controls to control playback. Everyone in the sync follows the host. Friends get an alert when you start a sync.";
     }
 
     applyLayout();
@@ -3967,9 +3124,6 @@
     root.className = "fj-root";
     root.innerHTML = `
       <div class="fj-status" data-fj="status"></div>
-      <section class="fj-block" data-fj-section="session">
-        <div data-fj="session"></div>
-      </section>
       <details class="fj-section" data-fj-section="sync">
         <summary><span class="fj-section-label">Playback sync</span><span class="fj-section-sub">Relay setup</span></summary>
         <div class="fj-section-body" data-fj="sync"></div>
@@ -3978,16 +3132,6 @@
         <summary><span class="fj-section-label">Friends</span><span class="fj-section-sub">Codes and invites</span></summary>
         <div class="fj-section-body" data-fj="friends"></div>
       </details>
-      <section class="fj-block" data-fj-section="requests">
-        <div class="fj-card">
-          <div class="fj-card-head">
-            <span class="fj-card-title">Recent requests</span>
-            <span class="fj-muted" data-fj="count"></span>
-          </div>
-          <div class="fj-now" data-fj="now"></div>
-          <div class="fj-list" data-fj="requests"></div>
-        </div>
-      </section>
       <details class="fj-section">
         <summary><span class="fj-section-label">Settings</span><span class="fj-section-sub">Alerts and panel</span></summary>
         <div class="fj-section-body" data-fj="settings"></div>
@@ -4031,68 +3175,6 @@
 
     try {
       switch (action) {
-        case "start": {
-          const input = $('[data-fj="name"]', ui.root);
-          const name =
-            (input && input.value.trim()) || defaultSessionName();
-          await createSession(name, null, false);
-          break;
-        }
-        case "adopt": {
-          const input = $('[data-fj="adopt"]', ui.root);
-          const uri = parsePlaylistInput(input ? input.value : "");
-          if (!uri) {
-            Spicetify.showNotification(
-              "Paste a valid Spotify playlist link or URI.",
-              true
-            );
-            return;
-          }
-          await createSession("FreeJam session", uri, true);
-          break;
-        }
-        case "copy": {
-          if (!state.inviteUrl) {
-            Spicetify.showNotification(
-              "No invite link yet. Create a new one or paste one.",
-              true
-            );
-            return;
-          }
-          const ok = await copyText(state.inviteUrl);
-          Spicetify.showNotification(
-            ok
-              ? "Invite link copied. Guests open it in the Spotify app."
-              : "Could not copy the invite link.",
-            !ok
-          );
-          break;
-        }
-        case "open":
-          openPlaylist();
-          break;
-        case "regenerate":
-          await regenerateInvite();
-          break;
-        case "retry":
-          if (state.playlistUri) await runPoll();
-          break;
-        case "pause":
-          state.paused = true;
-          saveState();
-          updateButton();
-          updatePanel(true);
-          break;
-        case "resume":
-          state.paused = false;
-          saveState();
-          updateButton();
-          updatePanel(true);
-          schedulePoll(200);
-          break;
-        case "saveInvite":
-          savePastedInvite();
-          break;
         case "announceJam": {
           if (!friends.identity) {
             Spicetify.showNotification(
@@ -4111,7 +3193,7 @@
           const jam = buildLocalJam();
           if (!jam) {
             Spicetify.showNotification(
-              "Start a sync session or a request session first.",
+              "Start a playback sync first.",
               true
             );
             return;
@@ -4175,10 +3257,8 @@
         }
         case "settingsCompactSections": {
           Object.assign(layout, {
-            session: true,
-            sync: false,
+            sync: true,
             friends: true,
-            requests: false,
             hint: false,
           });
           saveLayout();
@@ -4424,17 +3504,6 @@
           );
           break;
         }
-        case "end": {
-          if (Date.now() > endArmedUntil) {
-            endArmedUntil = Date.now() + 4000;
-            button.textContent = "Click again to end";
-            setTimeout(() => updatePanel(true), 4100);
-            return;
-          }
-          endArmedUntil = 0;
-          endSession();
-          break;
-        }
         case "syncHost": {
           const relayInput = $('[data-fj="relayUrl"]', ui.root);
           const nameInput = $('[data-fj="syncHostName"]', ui.root);
@@ -4555,62 +3624,15 @@
     }
   }
 
-  function registerContextMenu() {
-    if (!Spicetify.ContextMenu || !Spicetify.ContextMenu.Item) return;
-
-    try {
-      new Spicetify.ContextMenu.Item(
-        "Start FreeJam session with this playlist",
-        (uris) => {
-          const uri = uris && uris[0];
-          if (!uri) return;
-
-          if (state.playlistUri) {
-            Spicetify.showNotification(
-              "FreeJam already has an active request session. End it first.",
-              true
-            );
-            return;
-          }
-
-          createSession("FreeJam session", uri, true)
-            .then(() => openPanel())
-            .catch((err) => {
-              console.error("[FreeJam]", err);
-              Spicetify.showNotification(
-                `FreeJam: ${
-                  (err && err.message) || "Could not start the session."
-                }`,
-                true,
-                6000
-              );
-            });
-        },
-        (uris) =>
-          Boolean(
-            uris &&
-              uris.length === 1 &&
-              /^spotify:playlist:[A-Za-z0-9]+$/.test(uris[0])
-          ),
-        "collaborative"
-      ).register();
-    } catch (err) {
-      console.warn("[FreeJam] Could not register the context menu item", err);
-    }
-  }
-
   (async function init() {
     const ready = await waitFor(
       () =>
         window.Spicetify &&
         Spicetify.Platform &&
-        Spicetify.Platform.PlaylistAPI &&
-        Spicetify.Platform.RootlistAPI &&
         Spicetify.Player &&
         Spicetify.LocalStorage &&
         Spicetify.Playbar &&
-        Spicetify.PopupModal &&
-        typeof Spicetify.addToQueue === "function"
+        Spicetify.PopupModal
     );
 
     if (!ready) {
@@ -4626,7 +3648,6 @@
     loadLayout();
     injectStyles();
     createPlaybarButton();
-    registerContextMenu();
 
     // Browsers only allow audio after a user gesture. Prime the audio context
     // on the first click so the friend-alert ding can play later.
@@ -4649,10 +3670,6 @@
     }
 
     updateButton();
-
-    if (state.playlistUri) {
-      schedulePoll(1500);
-    }
 
     if (sync.role) {
       setTimeout(() => {

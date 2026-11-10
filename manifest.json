@@ -1,0 +1,14 @@
+{
+  "name": "FreeJam",
+  "description": "Host-authoritative playback sync for free Spotify accounts, plus private jam alerts from friends. No Premium and no Spotify Jam endpoints.",
+  "preview": "preview.png",
+  "main": "freejam.js",
+  "readme": "README.md",
+  "authors": [
+    {
+      "name": "Vineeth",
+      "url": "https://github.com/Vineeth-0"
+    }
+  ],
+  "tags": ["sync", "friends", "playback", "jam", "free"]
+}
