@@ -528,7 +528,7 @@ FreeJam relay listening on ws://0.0.0.0:8787
   LAN address: ws://192.168.x.x:8787
 ```
 
-Use the `192.168.x.x` address. Allow Node through the firewall if prompted.
+Replace each `x` with the numbers shown by your relay; the address above is a placeholder. Allow Node through the firewall if prompted.
 This only works while both devices are on the same network and the host PC is
 awake.
 

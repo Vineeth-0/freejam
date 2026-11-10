@@ -2403,7 +2403,7 @@
     const hostRow = el("div", "fj-row");
     const relayInput = document.createElement("input");
     relayInput.className = "fj-input";
-    relayInput.placeholder = "Your own relay: ws://192.168.x.x:8787";
+    relayInput.placeholder = "Your relay address: ws://<your-LAN-IP>:8787";
     relayInput.dataset.fj = "relayUrl";
     relayInput.value = sync.relayUrl || state.lastRelayUrl || "";
     const hostNameInput = document.createElement("input");
@@ -3512,7 +3512,7 @@
           );
           if (!relayUrl) {
             Spicetify.showNotification(
-              "Enter the relay WebSocket URL, for example ws://192.168.x.x:8787 on the same Wi-Fi, or the wss:// address of a tunnel you run yourself.",
+              "Enter the relay WebSocket URL, using the LAN address printed by your relay on the same Wi-Fi, or the wss:// address of a tunnel you run yourself.",
               true
             );
             return;
