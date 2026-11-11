@@ -17,7 +17,11 @@ if (-not (Test-Path -LiteralPath $source)) {
 
 $node = Get-Command node -ErrorAction SilentlyContinue
 if (-not $node) {
-    throw "Node.js 18 or newer is required. Install it from https://nodejs.org/ and run this installer again."
+    throw "Node.js 24 or newer is required. Install it from https://nodejs.org/ and run this installer again."
+}
+$nodeVersion = (& $node.Source --version).Trim().TrimStart("v")
+if ([version]$nodeVersion -lt [version]"24.0.0") {
+    throw "Node.js 24 or newer is required (found $nodeVersion). Install it from https://nodejs.org/ and run this installer again."
 }
 
 if (-not $Code) {

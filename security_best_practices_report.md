@@ -13,6 +13,15 @@ release packaging. Some limitations are already disclosed in README.md; disclosu
 does not remove their impact. A small, trusted private group has a narrower threat
 model than an internet-accessible relay.
 
+## Current release status (2026-11-10)
+
+The executive assessment above describes the reviewed commit. The current tree
+has remediated findings 1, 2, 4, 5, 6 and 7. Finding 3 (first-owner mailbox
+squatting) remains a documented limitation for a self-hosted relay shared with
+trusted friends; `README.md` discloses the trust model. This repository is being
+prepared for public distribution through the Spicetify Marketplace with that
+limitation disclosed, not as a hardened multi-tenant service.
+
 ## Remediation status
 
 The following fixes have since been applied locally on `main` after this audit:
@@ -254,6 +263,6 @@ flow separately. Decide explicitly whether to remove historical private details 
 other branches; history rewriting and force-pushing require separate authorization.
 
 Audit reproduction script is saved locally at
-`local audit script` and is not included in release
-source. It uses bounded in-memory fixtures and intentionally confirms current
+`C:\path\to\freejam-security-audit.cjs` and is not included in release source.
+It uses bounded in-memory fixtures and intentionally confirms current
 weaknesses; it is not a passing security regression suite.

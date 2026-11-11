@@ -7,7 +7,7 @@
  * case: Spotify is fully quit. It connects to the same friend mailbox as the
  * extension and shows an OS notification when an added friend starts a jam.
  *
- * It needs Node.js 18 or newer and has no npm dependencies.
+ * It needs Node.js 24 or newer and has no npm dependencies.
  *
  * Usage:
  *   node freejam-notifier.js --install FJN1...

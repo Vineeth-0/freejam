@@ -5,7 +5,7 @@
 #   bash install-notifier-macos.sh
 #   bash install-notifier-macos.sh FJN1...
 #
-# Requires Node.js 18 or newer.
+# Requires Node.js 24 or newer.
 
 set -euo pipefail
 
@@ -13,7 +13,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODE="${1:-}"
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "Node.js 18 or newer is required. Install it from https://nodejs.org/ and run this installer again." >&2
+  echo "Node.js 24 or newer is required. Install it from https://nodejs.org/ and run this installer again." >&2
+  exit 1
+fi
+
+NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+if [ "$NODE_MAJOR" -lt 24 ]; then
+  echo "Node.js 24 or newer is required (found $(node --version)). Install it from https://nodejs.org/ and run this installer again." >&2
   exit 1
 fi
 
