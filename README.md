@@ -11,11 +11,14 @@ paywall.
 
 ## Quick start
 
-1. **One person hosts the relay.** Follow [Hosting the relay](#hosting-the-relay).
-2. **Everyone installs FreeJam.** Follow [Install](#install).
-3. **The host starts a jam.** Open FreeJam, paste the relay URL, click
-   **Start sync**, and copy the `FJ1...` join code.
-4. **Everyone else joins.** Paste the code into **Join a sync session** and
+1. **Host:** run the relay on any device and keep the terminal open:
+   ```bash
+   npx --yes --package=github:Vineeth-0/freejam -- freejam-relay
+   ```
+2. **Everyone:** install FreeJam (see [Install](#install)).
+3. **Host:** open FreeJam, paste the address the relay printed, click
+   **Start sync**, then **Copy join code**.
+4. **Everyone else:** paste the `FJ1...` code into **Join a sync session** and
    click **Join sync**.
 
 The host owns playback. Guests can request skips, seeks, pause and play; the
@@ -46,20 +49,23 @@ run a relay.
 
 ## Hosting the relay
 
-Only the host needs this. The relay is one Node.js file with no dependencies.
-Use Node.js 24 or newer.
+Only the host needs this. You need Node.js 24 or newer and nothing else.
+
+```bash
+npx --yes --package=github:Vineeth-0/freejam -- freejam-relay
+```
+
+That one command works on Windows, macOS and Linux. It prints one or more
+addresses such as `ws://192.168.1.100:8787`; paste the one your guests can reach
+into FreeJam. Keep the terminal open while you jam.
+
+If you already have the repository, `node freejam-relay.js` does the same thing.
 
 ### Same Wi-Fi
 
-On the host PC:
-
-```bash
-node freejam-relay.js
-```
-
 The relay prints a LAN address such as `ws://192.168.x.x:8787`. Paste that into
 FreeJam. Allow Node through the firewall if Windows asks. This only works while
-everyone is on the same network and the host PC is awake.
+everyone is on the same network and the host device is awake.
 
 ### Internet
 
@@ -68,7 +74,7 @@ Cloudflare Quick Tunnel is the easiest option:
 
 ```bash
 # terminal 1
-node freejam-relay.js
+npx --yes --package=github:Vineeth-0/freejam -- freejam-relay
 
 # terminal 2
 cloudflared tunnel --url http://localhost:8787

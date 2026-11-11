@@ -4,6 +4,9 @@
   "private": true,
   "description": "Tiny dependency-free WebSocket relay for FreeJam sync mode and friend mailboxes",
   "main": "freejam-relay.js",
+  "bin": {
+    "freejam-relay": "freejam-relay.js"
+  },
   "scripts": {
     "start": "node freejam-relay.js"
   },

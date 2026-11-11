@@ -562,9 +562,6 @@ const server = http.createServer((req, res) => {
         "example:",
         `  ws://<this-machine-ip>:${PORT}`,
         "",
-        "Friend mailboxes: friends send jam invites only to the mailboxes of",
-        "people who added them. Nothing is broadcast to everyone.",
-        "",
         "Keep this process running while you use FreeJam.",
         "",
       ].join("\n")
