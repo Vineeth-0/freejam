@@ -1,6 +1,6 @@
 {
   "name": "FreeJam",
-  "description": "Spotify Jam but for free! Host-authoritative playback sync, plus private jam alerts from friends.",
+  "description": "Spotify Jam but for free! Playback sync, plus private jam alerts from friends.",
   "preview": "preview.png",
   "main": "freejam.js",
   "readme": "README.md",
