@@ -4,7 +4,7 @@ FreeJam adds a shared listening session to Spotify for free accounts. Everyone
 hears the same track at the same position, and anyone can skip, seek, pause or
 resume. It works through Spicetify and a small relay that you host yourself. It
 does not use Spotify's Premium-only Jam endpoints and does not bypass any
-paywall.
+paywall. Friends on the same relay can also ping each other when a jam starts.
 
 > **Only one person needs to run the relay.** Everyone else just installs the
 > extension and pastes the join code.
@@ -172,6 +172,22 @@ FreeJam is host-authoritative:
 FreeJam compensates for latency and ignores its own echo. Very small native
 seeks may be corrected by the host's next state update.
 
+## Optional: friend alerts
+
+Friends is an extra on top of sync. Both people install FreeJam and use the same
+relay.
+
+1. Open the **Friends** card and click **Copy my code**.
+2. Send that `FJF1...` code to the other person.
+3. They paste it under **Add a relay friend** and click **Add friend**.
+
+When one of you starts a sync, the other gets a notification with a join code.
+Only people you added can reach your mailbox; nothing is broadcast to everyone.
+
+For alerts while Spotify is fully closed, the optional notifier in `notifier/`
+does that. It needs Node.js 24+ and the `FJN1...` setup code from the Friends
+card.
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -204,6 +220,7 @@ seeks may be corrected by the host's next state update.
 | --- | --- |
 | `freejam.js` | The Spicetify extension. |
 | `freejam-relay.js` | The relay. Only the host runs it. |
+| `notifier/` | Optional background helper for friend alerts while Spotify is closed. |
 | `freejam-relay.service` | systemd unit for the relay. |
 | `freejam-tunnel.service` | systemd unit for a Cloudflare Quick Tunnel. |
 | `Dockerfile` | Container image for the relay. |
